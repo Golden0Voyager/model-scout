@@ -1,72 +1,101 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+"""ModelScout API v2.0
+
+Lightweight model monitoring dashboard.
+- SQLite persistence for health history
+- Config-driven model catalog
+- Lightweight probes (models endpoint + minimal chat ping)
+- Background scheduled scans
+"""
+
 import asyncio
-import httpx
-from typing import List, Dict
-from datetime import datetime
 import os
 import time
-import sys
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
-# Add parent directory to sys.path to support 'backend' package imports
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from fetchers import openrouter, groq, dashscope, siliconflow, zhipu, aihubmix, scnet
-from engine.benchmarker import Benchmarker
+import api.routes
+from api.routes import router
+from services.sync_service import SyncService
 
 load_dotenv()
 
-# Global State
-models_db: List[Dict] = []
-last_scan_time = None
-is_scanning = False
-cache_expiry = None
+# Verify key loading (prefixes only, for debugging)
+for _env_key in ["GROQ_API_KEY", "DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"]:
+    _val = os.getenv(_env_key, "NOT_SET")
+    _prefix = _val[:10] if len(_val) > 10 else _val
+    print(f"[env] {_env_key}: {_prefix}...")
 
-# Shared resources (initialized in lifespan)
-shared_http_client: httpx.AsyncClient = None      # 带代理，海外 API
-shared_http_client_cn: httpx.AsyncClient = None    # 直连，国内 API
-benchmarker: Benchmarker = None
-
-BENCH_PER_PROVIDER = int(os.getenv("BENCH_PER_PROVIDER", "4"))
 DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "5"))
+
+# Global state
+_start_time = time.time()
+_scan_task: Optional[asyncio.Task] = None
+
+
+async def _scheduled_scan_loop(service: SyncService):
+    """Background task that runs scans periodically."""
+    while True:
+        try:
+            await asyncio.sleep(SCAN_INTERVAL_MINUTES * 60)
+            if not service.is_scanning:
+                await service.run_sync()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[scheduler] Scan error: {e}")
+            await asyncio.sleep(60)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global shared_http_client, shared_http_client_cn, benchmarker
+    global _scan_task
 
     proxy = os.getenv("https_proxy") or os.getenv("http_proxy")
-    shared_http_client = httpx.AsyncClient(
-        proxy=proxy, timeout=10.0, follow_redirects=True
-    )
-    shared_http_client_cn = httpx.AsyncClient(
-        timeout=10.0, follow_redirects=True
-    )
-    benchmarker = Benchmarker(proxy=proxy)
+    service = SyncService(proxy=proxy)
+    await service.initialize()
 
-    # 启动时自动扫描
-    asyncio.create_task(run_global_scan())
+    # Wire routes
+    api.routes.sync_service = service
+
+    # Initial scan on startup
+    asyncio.create_task(service.run_sync())
+
+    # Start scheduler
+    _scan_task = asyncio.create_task(_scheduled_scan_loop(service))
+
+    print(f"🚀 ModelScout v2.0 started (scan interval: {SCAN_INTERVAL_MINUTES}min)")
 
     yield
 
-    # 清理资源
-    await shared_http_client.aclose()
-    await shared_http_client_cn.aclose()
-    await benchmarker.close()
+    # Shutdown
+    if _scan_task:
+        _scan_task.cancel()
+        try:
+            await _scan_task
+        except asyncio.CancelledError:
+            pass
+
+    await service.shutdown()
+    print("👋 ModelScout shutdown complete")
 
 
-app = FastAPI(title="ModelScout API", lifespan=lifespan)
+app = FastAPI(
+    title="ModelScout API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 if DEBUG:
     @app.middleware("http")
     async def log_requests(request, call_next):
         print(f"[DEBUG] {request.method} {request.url.path}")
-        response = await call_next(request)
-        return response
+        return await call_next(request)
 
-# Configure CORS for Next.js
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -78,96 +107,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-async def benchmark_model(model: Dict, semaphore: asyncio.Semaphore):
-    """Run benchmark for a single model with concurrency control."""
-    async with semaphore:
-        perf = await benchmarker.run_test(model["id"], model["provider"])
-        model["performance"] = perf
-        # Small delay to prevent burst limits on some APIs
-        await asyncio.sleep(0.3)
-
-
-async def run_global_scan():
-    global is_scanning, models_db, last_scan_time, cache_expiry
-    if is_scanning:
-        return
-
-    is_scanning = True
-    print("🚀 Starting high-throughput parallel scout...")
-    provider_models = {}
-
-    fetch_tasks = {
-        # 海外平台 — 走代理
-        "OpenRouter": openrouter.fetch_free_models(shared_http_client),
-        "Groq": groq.fetch_free_models(shared_http_client),
-        "AIHubMix": aihubmix.fetch_free_models(shared_http_client),
-        # 国内平台 — 直连
-        "DashScope": dashscope.fetch_free_models(shared_http_client_cn),
-        "SiliconFlow": siliconflow.fetch_free_models(shared_http_client_cn),
-        "ZhipuAI": zhipu.fetch_free_models(shared_http_client_cn),
-        "SCNET": scnet.fetch_free_models(shared_http_client_cn),
-    }
-
-    # execute fetchers in parallel
-    results = await asyncio.gather(*fetch_tasks.values(), return_exceptions=True)
-
-    all_models = []
-    for provider, res in zip(fetch_tasks.keys(), results):
-        if isinstance(res, Exception):
-            print(f"❌ {provider} Error: {res}")
-            provider_models[provider] = []
-        else:
-            print(f"✅ {provider}: discovered {len(res)} models")
-            provider_models[provider] = res
-            all_models.extend(res)
-
-    # 一次性更新全局模型列表
-    models_db = all_models
-    last_scan_time = datetime.now().isoformat()
-    cache_expiry = time.time() + 600
-
-    # Parallel Benchmarking: pick top N models from each provider
-    bench_batch = []
-    for provider, models in provider_models.items():
-        bench_batch.extend(models[:BENCH_PER_PROVIDER])
-
-    print(f"⚡️ Concurrent benchmarking batch: {len(bench_batch)} nodes from all providers...")
-    semaphore = asyncio.Semaphore(5)
-    bench_tasks = [benchmark_model(m, semaphore) for m in bench_batch]
-
-    if bench_tasks:
-        await asyncio.gather(*bench_tasks)
-
-    is_scanning = False
-    print("✨ Optimization scan complete.")
-
-
-@app.get("/models")
-async def get_models():
-    global cache_expiry
-    now = time.time()
-    if not is_scanning and (cache_expiry is None or now > cache_expiry):
-        asyncio.create_task(run_global_scan())
-
-    return {
-        "models": models_db,
-        "is_scanning": is_scanning,
-        "last_scan_time": last_scan_time
-    }
-
-
-@app.post("/trigger_scan")
-async def trigger_scan():
-    if not is_scanning:
-        asyncio.create_task(run_global_scan())
-        return {"status": "scan_started"}
-    return {"status": "already_scanning"}
-
-
 @app.get("/health")
 async def health():
-    return {"status": "alive"}
+    from core.models import HealthResponse
+    return HealthResponse(
+        status="healthy",
+        version="2.0.0",
+        uptime_seconds=time.time() - _start_time,
+    )
+
+app.include_router(router, prefix="/api")
 
 
 if __name__ == "__main__":

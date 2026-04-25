@@ -15,8 +15,8 @@ const firaCode = Fira_Code({
 });
 
 export const metadata: Metadata = {
-  title: "ModelScout | LLM 免费模型实时监控",
-  description: "追踪全球最强免费模型性能，提供实时延迟与稳定性报告",
+  title: "ModelScout | LLM Model Availability Monitor",
+  description: "Track free and paid LLM model performance with real-time latency and stability reports.",
 };
 
 export default function RootLayout({
@@ -25,7 +25,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="zh-CN" className={`${firaSans.variable} ${firaCode.variable}`}>
+    <html lang="en" className={`${firaSans.variable} ${firaCode.variable}`}>
       <body className="font-sans antialiased">{children}</body>
     </html>
   );

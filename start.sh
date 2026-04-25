@@ -1,43 +1,50 @@
 #!/bin/bash
 
-# ModelScout Launch Script
-# ------------------------
+# ModelScout v2.0 Launch Script
+# -----------------------------
 
-# Ensure proxies are set for international API access
+# Get script directory (works regardless of cwd)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Proxy settings for international API access
 export http_proxy=http://127.0.0.1:7897
 export https_proxy=http://127.0.0.1:7897
 export all_proxy=socks5://127.0.0.1:7897
 export no_proxy=localhost,127.0.0.1,::1
 
-# Ensure environment variables from ~/.zshrc are loaded
+# Load user env (API keys)
 if [ -f ~/.zshrc ]; then
-    echo "Sourcing ~/.zshrc..."
-    source ~/.zshrc
+    source ~/.zshrc >/dev/null 2>&1
 fi
 
-# Set explicit PATH for uv and other tools
 export PATH="/Users/hainingyu/.local/bin:$PATH"
+
+# Kill existing processes on ports 8000 and 3000
+echo "🧹 Cleaning up old processes..."
+lsof -ti:8000 | xargs kill -9 2>/dev/null
+lsof -ti:3000 | xargs kill -9 2>/dev/null
+sleep 1
 
 # 1. Start Backend
 echo "🚀 Starting ModelScout Backend..."
-cd backend
-PYTHONPATH=.. uv run python app.py > ../backend.log 2>&1 &
+cd "$SCRIPT_DIR/backend"
+PYTHONPATH=. uv run python app.py > "$SCRIPT_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 echo "✓ Backend started on port 8000 (PID: $BACKEND_PID)"
 
 # 2. Start Frontend
 echo "🌐 Starting ModelScout Frontend..."
-cd ../frontend
+cd "$SCRIPT_DIR/frontend"
 export PATH=$PATH:/opt/homebrew/bin
-npm run dev > ../frontend.log 2>&1 &
+npm run dev > "$SCRIPT_DIR/frontend.log" 2>&1 &
 FRONTEND_PID=$!
 echo "✓ Frontend started on port 3000 (PID: $FRONTEND_PID)"
 
 echo ""
-echo "✨ ModelScout is now running!"
-echo "👉 View Dashboard: http://localhost:3000"
-echo "👉 API Endpoint: http://localhost:8000/models"
+echo "✨ ModelScout v2.0 is now running!"
+echo "👉 Dashboard: http://localhost:3000"
+echo "👉 API:      http://localhost:8000/api/models"
+echo "👉 Health:   http://localhost:8000/health"
 echo ""
-echo "To stop the services, run: kill $BACKEND_PID $FRONTEND_PID"
-
-# Keep script alive is not needed as they run in background
+echo "Logs: backend.log / frontend.log"
+echo "Stop:  kill $BACKEND_PID $FRONTEND_PID"
