@@ -33,8 +33,8 @@ class HealthChecker:
         self._proxy_client: Optional[httpx.AsyncClient] = None
         self._direct_client: Optional[httpx.AsyncClient] = None
         self._openai_clients: Dict[str, AsyncOpenAI] = {}
-        # Cache for provider model lists: provider_key -> (fetch_time_ms, models_set)
-        self._models_cache: Dict[str, Tuple[int, set]] = {}
+        # Cache for provider model lists: provider_key -> (fetch_time_ms, models_set, latency_ms)
+        self._models_cache: Dict[str, Tuple[int, set, Optional[int]]] = {}
         self._cache_ttl_ms = 30000  # 30s cache for models endpoint
 
     async def __aenter__(self):
@@ -81,9 +81,9 @@ class HealthChecker:
         now = int(time.time() * 1000)
         cached = self._models_cache.get(provider.key)
         if cached:
-            cached_time, cached_set = cached
+            cached_time, cached_set, cached_latency = cached
             if now - cached_time < self._cache_ttl_ms:
-                return cached_set, None, None
+                return cached_set, cached_latency, None
 
         client = self._get_http_client(provider)
         url = f"{provider.base_url}{provider.models_endpoint}"
@@ -98,7 +98,7 @@ class HealthChecker:
                 data = response.json()
                 models = data.get("data", [])
                 model_ids = {m.get("id") or m.get("name") for m in models if m.get("id") or m.get("name")}
-                self._models_cache[provider.key] = (now, model_ids)
+                self._models_cache[provider.key] = (now, model_ids, latency_ms)
                 return model_ids, latency_ms, None
 
             return None, latency_ms, f"HTTP {response.status_code}"
@@ -305,6 +305,13 @@ class HealthChecker:
                 "id": mid,
                 "name": m.get("name") or mid,
             }
+            # Moonshot metadata
+            if "context_length" in m:
+                info["context_length"] = m["context_length"]
+            if m.get("supports_image_in"):
+                info["capabilities"] = ["chat", "vision"]
+            else:
+                info["capabilities"] = ["chat"]
             # OpenRouter pricing
             pricing = m.get("pricing")
             if isinstance(pricing, dict):
