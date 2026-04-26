@@ -77,6 +77,30 @@ class SyncService:
                 print(f"🔎 {provider.name}: discovered {len(free_models)} free models")
                 continue
 
+            # Moonshot: detailed discovery with context_length and vision support
+            if provider_key == "moonshot":
+                models_info, error = await self._checker.discover_models_detailed(provider_key)
+                if not models_info:
+                    if error:
+                        print(f"⚠️ Discovery failed for {provider.name}: {error}")
+                    continue
+                for info in models_info:
+                    mid = info["id"]
+                    if (provider_key, mid) in static_keys:
+                        continue
+                    discovered.append(ModelConfig(
+                        id=mid,
+                        name=info.get("name", mid),
+                        provider=provider_key,
+                        context_length=info.get("context_length", 128000),
+                        description=f"Auto-discovered from {provider.name}",
+                        description_cn=f"从 {provider.name} 自动发现",
+                        capabilities=info.get("capabilities", ["chat"]),
+                        probe_mode="chat",
+                    ))
+                print(f"🔎 {provider.name}: discovered {len(models_info)} models with metadata")
+                continue
+
             # Other providers: standard ID-only discovery
             model_ids, error = await self._checker.discover_models(provider_key)
             if not model_ids:
