@@ -180,7 +180,7 @@ export default function Home() {
   const [expandedProviders, setExpandedProviders] = useState<Set<string>>(new Set());
   const [capFilter, setCapFilter] = useState<string | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("default");
-  const [providerSortKey, setProviderSortKey] = useState<ProviderSortKey>("default");
+  const [providerSortKey, setProviderSortKey] = useState<ProviderSortKey>("manual");
   const [viewMode, setViewMode] = useState<ViewMode>("card");
   const [tabFilter, setTabFilter] = useState<TabFilter>("all");
   const [sortOpen, setSortOpen] = useState(false);
