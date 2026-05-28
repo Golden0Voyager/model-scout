@@ -229,7 +229,7 @@ export default function Home() {
       setError(null);
 
       if (!hasInit.current && json.models.length > 0) {
-        setExpandedProviders(new Set(json.providers.map((p) => p.key)));
+        setExpandedProviders(new Set());
         hasInit.current = true;
       }
     } catch (e) {
