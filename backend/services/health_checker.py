@@ -58,6 +58,12 @@ class HealthChecker:
     def _get_http_client(self, provider: ProviderConfig) -> httpx.AsyncClient:
         return self._direct_client if provider.network == "direct" else self._proxy_client
 
+    def _get_auth_headers(self, provider: ProviderConfig) -> Dict[str, str]:
+        api_key = os.getenv(provider.api_key_env, "")
+        if provider.auth_style == "api_key":
+            return {"api-key": api_key}
+        return {"Authorization": f"Bearer {api_key}"}
+
     def _get_openai_client(self, provider: ProviderConfig) -> Optional[AsyncOpenAI]:
         if provider.key in self._openai_clients:
             return self._openai_clients[provider.key]
@@ -67,10 +73,14 @@ class HealthChecker:
             return None
 
         http_client = self._get_http_client(provider)
+        extra_headers = {}
+        if provider.auth_style == "api_key":
+            extra_headers = {"api-key": api_key}
         client = AsyncOpenAI(
             base_url=provider.base_url,
             api_key=api_key,
             http_client=http_client,
+            default_headers=extra_headers or None,
         )
         self._openai_clients[provider.key] = client
         return client
@@ -87,7 +97,7 @@ class HealthChecker:
 
         client = self._get_http_client(provider)
         url = f"{provider.base_url}{provider.models_endpoint}"
-        headers = {"Authorization": f"Bearer {os.getenv(provider.api_key_env)}"}
+        headers = self._get_auth_headers(provider)
 
         start = time.perf_counter()
         try:
@@ -258,7 +268,7 @@ class HealthChecker:
         """Fetch the provider's raw model list (with metadata). No caching."""
         client = self._get_http_client(provider)
         url = f"{provider.base_url}{provider.models_endpoint}"
-        headers = {"Authorization": f"Bearer {os.getenv(provider.api_key_env)}"}
+        headers = self._get_auth_headers(provider)
         try:
             response = await client.get(url, headers=headers)
             if response.status_code == 200:
