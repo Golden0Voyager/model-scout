@@ -23,8 +23,12 @@ from services.sync_service import SyncService
 
 load_dotenv()
 
+# Clear proxy env vars — user is abroad, direct access to all providers
+for _p in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+    os.environ.pop(_p, None)
+
 # Verify key loading (prefixes only, for debugging)
-for _env_key in ["GROQ_API_KEY", "DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY"]:
+for _env_key in ["GROQ_API_KEY", "DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "SENSENOVA_API_KEY"]:
     _val = os.getenv(_env_key, "NOT_SET")
     _prefix = _val[:10] if len(_val) > 10 else _val
     print(f"[env] {_env_key}: {_prefix}...")
