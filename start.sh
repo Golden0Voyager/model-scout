@@ -6,16 +6,20 @@
 # Get script directory (works regardless of cwd)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Proxy settings for international API access
-export http_proxy=http://127.0.0.1:7897
-export https_proxy=http://127.0.0.1:7897
-export all_proxy=socks5://127.0.0.1:7897
-export no_proxy=localhost,127.0.0.1,::1
+# Proxy disabled — user is abroad, direct access to all providers
+# Uncomment below if you need proxy for specific providers:
+# export http_proxy=http://127.0.0.1:7897
+# export https_proxy=http://127.0.0.1:7897
+# export all_proxy=socks5://127.0.0.1:7897
+# export no_proxy=localhost,127.0.0.1,::1
 
 # Load user env (API keys)
 if [ -f ~/.zshrc ]; then
     source ~/.zshrc >/dev/null 2>&1
 fi
+
+# Ensure no proxy leaks from shell config (user is abroad, direct access)
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
 
 export PATH="/Users/hainingyu/.local/bin:$PATH"
 
