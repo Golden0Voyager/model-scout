@@ -108,7 +108,17 @@ class SyncService:
                     print(f"⚠️ Discovery failed for {provider.name}: {error}")
                 continue
             for mid in model_ids:
+                # Gemini API returns IDs with "models/" prefix — strip it
+                if mid.startswith("models/"):
+                    mid = mid[len("models/"):]
                 if (provider_key, mid) in static_keys:
+                    continue
+                # Skip non-chat models (embedding, image gen, video, audio, TTS, etc.)
+                _skip = ["embedding", "imagen", "veo", "lyria", "deep-research",
+                         "-tts", "-audio", "-live", "-image-preview", "robotics",
+                         "computer-use", "aqa", "antigravity", "nano-banana",
+                         "-customtools"]
+                if any(k in mid.lower() for k in _skip):
                     continue
                 # Infer reasonable defaults from model ID
                 inferred_ctx = 128000
@@ -117,6 +127,9 @@ class SyncService:
                 elif any(k in mid.lower() for k in ["256k", "-256b"]):
                     inferred_ctx = 256000
                 elif any(k in mid.lower() for k in ["1m", "1000000", "1000k"]):
+                    inferred_ctx = 1000000
+                # Gemini chat models default to 1M context (except Gemma)
+                if provider_key == "gemini" and mid.startswith("gemini-"):
                     inferred_ctx = 1000000
 
                 discovered.append(ModelConfig(
