@@ -1,3 +1,10 @@
+## ⚠️ 环境约束（强制）
+
+- **包管理器**：`uv pip install <pkg>`（禁止 `pip` / `python -m pip`）
+- **运行脚本**：`uv run python <script>.py`（禁止直接 `python`）
+
+---
+
 # CLAUDE.md — ModelScout v2.0
 
 ## 项目概述
