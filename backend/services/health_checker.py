@@ -6,16 +6,16 @@ Replaces the heavy chat-completion benchmark with fast probes:
 3. skip: No API key or unsupported
 """
 
+import asyncio
 import os
 import time
-import asyncio
-from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
 from openai import AsyncOpenAI
 
-from core.config import get_provider_config, ProviderConfig
+from core.config import ProviderConfig, get_provider_config
 
 
 @dataclass
@@ -23,18 +23,18 @@ class ProbeResult:
     model_id: str
     provider: str
     status: str  # online | offline | unknown | error | no_key
-    latency_ms: Optional[int] = None
-    error_message: Optional[str] = None
+    latency_ms: int | None = None
+    error_message: str | None = None
 
 
 class HealthChecker:
-    def __init__(self, proxy: Optional[str] = None):
+    def __init__(self, proxy: str | None = None):
         self._proxy = proxy
-        self._proxy_client: Optional[httpx.AsyncClient] = None
-        self._direct_client: Optional[httpx.AsyncClient] = None
-        self._openai_clients: Dict[str, AsyncOpenAI] = {}
+        self._proxy_client: httpx.AsyncClient | None = None
+        self._direct_client: httpx.AsyncClient | None = None
+        self._openai_clients: dict[str, AsyncOpenAI] = {}
         # Cache for provider model lists: provider_key -> (fetch_time_ms, models_set, latency_ms)
-        self._models_cache: Dict[str, Tuple[int, set, Optional[int]]] = {}
+        self._models_cache: dict[str, tuple[int, set, int | None]] = {}
         self._cache_ttl_ms = 30000  # 30s cache for models endpoint
 
     async def __aenter__(self):
@@ -58,13 +58,13 @@ class HealthChecker:
     def _get_http_client(self, provider: ProviderConfig) -> httpx.AsyncClient:
         return self._direct_client if provider.network == "direct" else self._proxy_client
 
-    def _get_auth_headers(self, provider: ProviderConfig) -> Dict[str, str]:
+    def _get_auth_headers(self, provider: ProviderConfig) -> dict[str, str]:
         api_key = os.getenv(provider.api_key_env, "")
         if provider.auth_style == "api_key":
             return {"api-key": api_key}
         return {"Authorization": f"Bearer {api_key}"}
 
-    def _get_openai_client(self, provider: ProviderConfig) -> Optional[AsyncOpenAI]:
+    def _get_openai_client(self, provider: ProviderConfig) -> AsyncOpenAI | None:
         if provider.key in self._openai_clients:
             return self._openai_clients[provider.key]
 
@@ -85,7 +85,7 @@ class HealthChecker:
         self._openai_clients[provider.key] = client
         return client
 
-    async def _fetch_provider_models(self, provider: ProviderConfig) -> Tuple[Optional[set], Optional[int], Optional[str]]:
+    async def _fetch_provider_models(self, provider: ProviderConfig) -> tuple[set | None, int | None, str | None]:
         """Fetch the provider's model list, with caching.
         Returns (model_ids_set, latency_ms, error_message)."""
         now = int(time.time() * 1000)
@@ -264,7 +264,7 @@ class HealthChecker:
                 error_message=msg[:120],
             )
 
-    async def _fetch_provider_models_raw(self, provider: ProviderConfig) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    async def _fetch_provider_models_raw(self, provider: ProviderConfig) -> tuple[list[dict[str, Any]] | None, str | None]:
         """Fetch the provider's raw model list (with metadata). No caching."""
         client = self._get_http_client(provider)
         url = f"{provider.base_url}{provider.models_endpoint}"
@@ -279,7 +279,7 @@ class HealthChecker:
         except Exception as e:
             return None, str(e)[:120]
 
-    async def discover_models(self, provider_key: str) -> Tuple[Optional[List[str]], Optional[str]]:
+    async def discover_models(self, provider_key: str) -> tuple[list[str] | None, str | None]:
         """Discover available model IDs from a dynamic provider."""
         provider = get_provider_config(provider_key)
         if not provider:
@@ -294,7 +294,7 @@ class HealthChecker:
 
     async def discover_models_detailed(
         self, provider_key: str
-    ) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    ) -> tuple[list[dict[str, Any]] | None, str | None]:
         """Discover models with metadata (id, name, pricing, etc.)."""
         provider = get_provider_config(provider_key)
         if not provider:
@@ -306,12 +306,12 @@ class HealthChecker:
         if models is None:
             return None, error
 
-        results: List[Dict[str, Any]] = []
+        results: list[dict[str, Any]] = []
         for m in models:
             mid = m.get("id") or m.get("name")
             if not mid:
                 continue
-            info: Dict[str, Any] = {
+            info: dict[str, Any] = {
                 "id": mid,
                 "name": m.get("name") or mid,
             }
@@ -337,19 +337,19 @@ class HealthChecker:
         return results, None
 
     async def probe_batch(
-        self, probes: List[Dict[str, str]], concurrency: int = 8
-    ) -> List[ProbeResult]:
+        self, probes: list[dict[str, str]], concurrency: int = 8
+    ) -> list[ProbeResult]:
         """Probe multiple models with controlled concurrency."""
         semaphore = asyncio.Semaphore(concurrency)
 
-        async def _wrapped(p: Dict[str, str]) -> ProbeResult:
+        async def _wrapped(p: dict[str, str]) -> ProbeResult:
             async with semaphore:
                 try:
                     result = await asyncio.wait_for(
                         self.probe(p["model_id"], p["provider"]),
                         timeout=20.0,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     return ProbeResult(
                         model_id=p["model_id"],
                         provider=p["provider"],

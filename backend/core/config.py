@@ -4,8 +4,6 @@ Static model catalog + provider discovery settings.
 All models from the user's documented providers are listed here.
 """
 
-import os
-from typing import Dict, List, Optional
 from dataclasses import dataclass, field
 
 
@@ -15,12 +13,12 @@ class ModelConfig:
     name: str
     provider: str
     context_length: int
-    max_output_tokens: Optional[int] = None
+    max_output_tokens: int | None = None
     description: str = ""
     description_cn: str = ""
-    capabilities: List[str] = field(default_factory=list)
-    pricing_input_per_1m: Optional[float] = None
-    pricing_output_per_1m: Optional[float] = None
+    capabilities: list[str] = field(default_factory=list)
+    pricing_input_per_1m: float | None = None
+    pricing_output_per_1m: float | None = None
     pricing_currency: str = "CNY"
     pricing_note: str = ""
     is_free: bool = False
@@ -39,7 +37,7 @@ class ProviderConfig:
     # Discovery mode: "static" | "dynamic"
     discovery: str = "static"
     # For dynamic discovery, the endpoint path
-    models_endpoint: Optional[str] = None
+    models_endpoint: str | None = None
     # Whether to auto-discover and add new models not in STATIC_MODELS
     auto_discover: bool = False
     # Auth style: "bearer" (default, Authorization: Bearer <key>) or "api_key" (api-key: <key>)
@@ -49,7 +47,7 @@ class ProviderConfig:
 # ---------------------------------------------------------------------------
 # Provider definitions
 # ---------------------------------------------------------------------------
-PROVIDERS: Dict[str, ProviderConfig] = {
+PROVIDERS: dict[str, ProviderConfig] = {
     "scnet": ProviderConfig(
         key="scnet",
         name="SCNet",
@@ -225,7 +223,7 @@ PROVIDERS: Dict[str, ProviderConfig] = {
 # ---------------------------------------------------------------------------
 # Static model catalog (from user documentation)
 # ---------------------------------------------------------------------------
-STATIC_MODELS: List[ModelConfig] = [
+STATIC_MODELS: list[ModelConfig] = [
     # ===== SCNet (国家超算互联网) =====
     ModelConfig(
         id="MiniMax-M2.5",
@@ -973,13 +971,13 @@ STATIC_MODELS: List[ModelConfig] = [
 ]
 
 
-def get_provider_config(key: str) -> Optional[ProviderConfig]:
+def get_provider_config(key: str) -> ProviderConfig | None:
     return PROVIDERS.get(key)
 
 
-def get_static_models() -> List[ModelConfig]:
+def get_static_models() -> list[ModelConfig]:
     return STATIC_MODELS
 
 
-def get_models_for_provider(provider_key: str) -> List[ModelConfig]:
+def get_models_for_provider(provider_key: str) -> list[ModelConfig]:
     return [m for m in STATIC_MODELS if m.provider == provider_key]
