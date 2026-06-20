@@ -1,5 +1,4 @@
 """Basic tests for model_scout backend."""
-import pytest
 
 
 def test_app_imports():
