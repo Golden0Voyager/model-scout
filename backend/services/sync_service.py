@@ -1,31 +1,30 @@
 """Orchestrates model discovery and health checks."""
 
-import asyncio
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
-from core.config import get_static_models, get_provider_config, ProviderConfig, ModelConfig
+from core.config import ModelConfig, get_provider_config, get_static_models
 from core.database import (
-    init_db,
-    upsert_health,
     get_all_health,
-    log_scan_start,
-    log_scan_finish,
     get_last_scan_time,
+    init_db,
+    log_scan_finish,
+    log_scan_start,
+    upsert_health,
 )
 from services.health_checker import HealthChecker, ProbeResult
 
 
 class SyncService:
-    def __init__(self, proxy: Optional[str] = None):
+    def __init__(self, proxy: str | None = None):
         self.proxy = proxy
         self.is_scanning = False
-        self.last_scan_time: Optional[str] = None
-        self._checker: Optional[HealthChecker] = None
-        self._discovered_models: List[ModelConfig] = []
-        self._discovered_at: Optional[datetime] = None
+        self.last_scan_time: str | None = None
+        self._checker: HealthChecker | None = None
+        self._discovered_models: list[ModelConfig] = []
+        self._discovered_at: datetime | None = None
 
-    def _get_all_models(self) -> List[ModelConfig]:
+    def _get_all_models(self) -> list[ModelConfig]:
         """Return static + discovered models."""
         static = get_static_models()
         # Merge: static models take precedence over discovered ones
@@ -41,7 +40,7 @@ class SyncService:
         if not self._checker:
             return
         from core.config import PROVIDERS
-        discovered: List[ModelConfig] = []
+        discovered: list[ModelConfig] = []
         static_keys = {(m.provider, m.id) for m in get_static_models()}
 
         for provider_key, provider in PROVIDERS.items():
@@ -144,7 +143,7 @@ class SyncService:
                 ))
 
         self._discovered_models = discovered
-        self._discovered_at = datetime.now(timezone.utc)
+        self._discovered_at = datetime.now(UTC)
         if discovered:
             print(f"🔎 Discovered {len(discovered)} new models from dynamic providers")
 
@@ -157,14 +156,14 @@ class SyncService:
         if self._checker:
             await self._checker.__aexit__(None, None, None)
 
-    async def run_sync(self) -> Dict[str, Any]:
+    async def run_sync(self) -> dict[str, Any]:
         """Full sync: probe all configured models."""
         if self.is_scanning:
             return {"status": "already_scanning"}
 
         self.is_scanning = True
         scan_id = await log_scan_start()
-        start_time = datetime.now(timezone.utc)
+        start_time = datetime.now(UTC)
 
         try:
             # Discover new models from dynamic providers first
@@ -175,7 +174,7 @@ class SyncService:
             skipped = [m for m in models if m.probe_mode == "none"]
 
             print(f"🔍 Starting health check for {len(probes)} models ({len(skipped)} skipped)...")
-            results: List[ProbeResult] = await self._checker.probe_batch(probes, concurrency=6)
+            results: list[ProbeResult] = await self._checker.probe_batch(probes, concurrency=6)
 
             online_count = 0
             for r in results:
@@ -187,7 +186,7 @@ class SyncService:
                     "status": r.status,
                     "latency_ms": r.latency_ms,
                     "error_message": r.error_message,
-                    "last_checked": datetime.now(timezone.utc).isoformat(),
+                    "last_checked": datetime.now(UTC).isoformat(),
                 })
 
             # Mark skipped models as unknown with no error
@@ -198,13 +197,13 @@ class SyncService:
                     "status": "unknown",
                     "latency_ms": None,
                     "error_message": "Probe disabled for this provider",
-                    "last_checked": datetime.now(timezone.utc).isoformat(),
+                    "last_checked": datetime.now(UTC).isoformat(),
                 })
 
             await log_scan_finish(scan_id, len(probes), online_count)
-            self.last_scan_time = datetime.now(timezone.utc).isoformat()
+            self.last_scan_time = datetime.now(UTC).isoformat()
 
-            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+            duration = (datetime.now(UTC) - start_time).total_seconds()
             print(f"✅ Sync complete in {duration:.1f}s: {online_count}/{len(probes)} online ({len(skipped)} skipped)")
 
             return {
@@ -237,11 +236,11 @@ class SyncService:
             "status": result.status,
             "latency_ms": result.latency_ms,
             "error_message": result.error_message,
-            "last_checked": datetime.now(timezone.utc).isoformat(),
+            "last_checked": datetime.now(UTC).isoformat(),
         })
         return result
 
-    async def probe_provider(self, provider_key: str) -> Dict[str, Any]:
+    async def probe_provider(self, provider_key: str) -> dict[str, Any]:
         """Probe all models for a single provider."""
         if not self._checker:
             return {"status": "error", "message": "Health checker not initialized"}
@@ -267,7 +266,7 @@ class SyncService:
                 "status": r.status,
                 "latency_ms": r.latency_ms,
                 "error_message": r.error_message,
-                "last_checked": datetime.now(timezone.utc).isoformat(),
+                "last_checked": datetime.now(UTC).isoformat(),
             })
 
         return {
@@ -277,7 +276,7 @@ class SyncService:
             "online": online_count,
         }
 
-    async def get_dashboard_data(self) -> Dict[str, Any]:
+    async def get_dashboard_data(self) -> dict[str, Any]:
         """Combine static model catalog with latest health data."""
         # Refresh discovered models if we have none yet
         if not self._discovered_models and self._checker:
@@ -285,13 +284,13 @@ class SyncService:
 
         models = self._get_all_models()
         health_rows = await get_all_health()
-        health_map: Dict[str, Dict[str, Any]] = {
+        health_map: dict[str, dict[str, Any]] = {
             f"{r['provider']}::{r['model_id']}": r for r in health_rows
         }
 
-        provider_stats: Dict[str, Dict[str, Any]] = {}
+        provider_stats: dict[str, dict[str, Any]] = {}
         total_online = 0
-        latencies: List[int] = []
+        latencies: list[int] = []
 
         enriched_models = []
         for m in models:

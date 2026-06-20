@@ -11,11 +11,10 @@ import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 
 import api.routes
 from api.routes import router
@@ -38,7 +37,7 @@ SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "5"))
 
 # Global state
 _start_time = time.time()
-_scan_task: Optional[asyncio.Task] = None
+_scan_task: asyncio.Task | None = None
 
 
 async def _scheduled_scan_loop(service: SyncService):

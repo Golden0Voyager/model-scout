@@ -13,3 +13,35 @@ dependencies = [
     "uvicorn>=0.44.0",
     "aiosqlite>=0.21.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5.0",
+    "mypy>=1.10.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501", "SIM105"]
+
+[tool.mypy]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["."]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+
+[tool.bandit]
+skips = ["B101", "B311", "B404", "B603"]
