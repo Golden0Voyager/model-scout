@@ -30,10 +30,10 @@ jobs:
         run: uv run ruff check .
 
       - name: Run mypy
-        run: uv run mypy . || true
+        run: uv run mypy
 
       - name: Run tests with coverage
-        run: uv run pytest --cov --cov-report=term-missing tests/ 2>/dev/null || echo "No tests found"
+        run: uv run pytest --cov --cov-report=term-missing tests/
 
       - name: Enforce coverage threshold
-        run: uv run coverage report || echo "Coverage check skipped"
+        run: uv run coverage report
