@@ -25,6 +25,7 @@ import {
   GripVertical,
 } from "lucide-react";
 import ModelModal from "./components/ModelModal";
+import { formatContext, formatPrice, latencyColor } from "../lib/format";
 import {
   DndContext,
   closestCenter,
@@ -98,27 +99,6 @@ const STATUS_META: Record<string, { label: string; color: string; icon: React.Re
   no_key: { label: "No Key", color: "#64748b", icon: <Key className="w-3.5 h-3.5" />, sortOrder: 3 },
   unknown: { label: "Unknown", color: "#3b82f6", icon: <HelpCircle className="w-3.5 h-3.5" />, sortOrder: 4 },
 };
-
-function latencyColor(ms: number): string {
-  if (ms < 200) return "#22c55e";   // emerald-500 - excellent
-  if (ms < 500) return "#f59e0b";   // amber-500   - good
-  if (ms < 1000) return "#f97316";  // orange-500  - fair
-  return "#ef4444";                  // red-500     - poor
-}
-
-const CNY_TO_USD = 7.2;
-
-function formatPrice(input?: number, output?: number, currency?: string): string {
-  if (input == null || output == null) return "Pricing N/A";
-  const cny = currency === "CNY" || !currency;
-  if (cny) {
-    const inUsd = input / CNY_TO_USD;
-    const outUsd = output / CNY_TO_USD;
-    return `$${inUsd.toFixed(2)} / $${outUsd.toFixed(2)} per 1M tokens (¥${input.toFixed(2)} / ¥${output.toFixed(2)})`;
-  }
-  // USD or other currency — display as-is
-  return `$${input.toFixed(2)} / $${output.toFixed(2)} per 1M tokens`;
-}
 
 const CAPABILITY_LABELS: Record<string, string> = {
   chat: "Chat",
@@ -996,7 +976,7 @@ function ModelCard({ model, isScanning, onRefresh, onSelect }: { model: Model; i
           </span>
         ) : (
           <span className="text-[11px] text-slate-400">
-            {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency)}
+            {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency) ?? "Pricing N/A"}
             {model.pricing_note && <span className="text-slate-600 ml-1">· {model.pricing_note}</span>}
           </span>
         )}
@@ -1089,7 +1069,7 @@ function ModelListRow({ model, isScanning, onRefresh, onSelect }: { model: Model
           <span className="text-emerald-400 font-medium">Free</span>
         ) : (
           <span className="text-slate-400">
-            {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency)}
+            {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency) ?? "Pricing N/A"}
           </span>
         )}
       </div>
@@ -1125,11 +1105,6 @@ function StatCard({ label, value, icon }: { label: string; value: string; icon: 
   );
 }
 
-function formatContext(n: number): string {
-  if (n >= 1000000) return `${(n / 1000000).toFixed(0)}M`;
-  if (n >= 1000) return `${(n / 1000).toFixed(0)}K`;
-  return `${n}`;
-}
 
 function formatTime(iso: string): string {
   try {
