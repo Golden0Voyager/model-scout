@@ -40,6 +40,9 @@ class ProviderConfig:
     models_endpoint: str | None = None
     # Whether to auto-discover and add new models not in STATIC_MODELS
     auto_discover: bool = False
+    # Disabled providers keep their catalog rows on the dashboard but are never
+    # discovered or probed — for dead keys or upstreams that are down
+    enabled: bool = True
     # /models returns per-model metadata (context, modalities, features, pricing)
     # rather than bare IDs
     rich_discovery: bool = False
@@ -164,10 +167,13 @@ PROVIDERS: dict[str, ProviderConfig] = {
     "anyrouter": ProviderConfig(
         key="anyrouter",
         name="AnyRouter",
-        base_url="https://api.anyrouter.net/v1",  # User must set correct endpoint in .env if available
+        # Unreachable both directly and through the proxy; the base URL was never
+        # confirmed and no env override reads it.
+        base_url="https://api.anyrouter.net/v1",
         api_key_env="ANYROUTER_API_KEY",
         network="proxy",
         discovery="static",
+        enabled=False,
     ),
     "agentrouter": ProviderConfig(
         key="agentrouter",
@@ -178,6 +184,8 @@ PROVIDERS: dict[str, ProviderConfig] = {
         discovery="dynamic",
         models_endpoint="/models",
         auto_discover=True,
+        # /models returns 401: the key is invalid or expired
+        enabled=False,
     ),
     "mimo": ProviderConfig(
         key="mimo",
@@ -189,6 +197,8 @@ PROVIDERS: dict[str, ProviderConfig] = {
         models_endpoint="/models",
         auth_style="api_key",
         auto_discover=True,
+        # /models returns 401 while MIMO_PAYG_API_KEY works fine
+        enabled=False,
     ),
     "mimo_payg": ProviderConfig(
         key="mimo_payg",
@@ -474,7 +484,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="gpt-5-codex",
         name="GPT-5 Codex",
         provider="anyrouter",
-        probe_mode="none",
         context_length=128000,
         description="OpenAI GPT-5 Codex, latest coding-focused frontier model.",
         description_cn="OpenAI GPT-5 Codex，最新编程专精前沿模型。",
@@ -487,7 +496,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="gpt-5.3-codex",
         name="GPT-5.3 Codex",
         provider="anyrouter",
-        probe_mode="none",
         context_length=128000,
         description="OpenAI GPT-5.3 Codex, enhanced coding and reasoning.",
         description_cn="OpenAI GPT-5.3 Codex，增强版编程和推理模型。",
@@ -500,7 +508,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="claude-3-5-haiku-20241022",
         name="Claude 3.5 Haiku",
         provider="anyrouter",
-        probe_mode="none",
         context_length=200000,
         description="Anthropic Claude 3.5 Haiku. Fast, cost-effective for light tasks.",
         description_cn="Anthropic Claude 3.5 Haiku，轻量任务快速响应。",
@@ -513,7 +520,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="claude-3-5-sonnet-20241022",
         name="Claude 3.5 Sonnet",
         provider="anyrouter",
-        probe_mode="none",
         context_length=200000,
         description="Anthropic Claude 3.5 Sonnet. Strong reasoning and coding.",
         description_cn="Anthropic Claude 3.5 Sonnet，推理和编程能力强。",
@@ -526,7 +532,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="claude-3-7-sonnet-20250219",
         name="Claude 3.7 Sonnet",
         provider="anyrouter",
-        probe_mode="none",
         context_length=200000,
         description="Anthropic Claude 3.7 Sonnet with extended thinking.",
         description_cn="Anthropic Claude 3.7 Sonnet，支持扩展思考模式。",
@@ -539,7 +544,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="claude-haiku-4-5-20251001",
         name="Claude Haiku 4.5",
         provider="anyrouter",
-        probe_mode="none",
         context_length=200000,
         description="Anthropic Claude Haiku 4.5, next-gen light model.",
         description_cn="Anthropic Claude Haiku 4.5，下一代轻量模型。",
@@ -552,7 +556,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="claude-opus-4-1-20250805",
         name="Claude Opus 4.1",
         provider="anyrouter",
-        probe_mode="none",
         context_length=200000,
         description="Anthropic Claude Opus 4.1, top-tier frontier model.",
         description_cn="Anthropic Claude Opus 4.1，顶级前沿模型。",
@@ -565,7 +568,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="claude-opus-4-20250514",
         name="Claude Opus 4",
         provider="anyrouter",
-        probe_mode="none",
         context_length=200000,
         description="Anthropic Claude Opus 4, predecessor to 4.1.",
         description_cn="Anthropic Claude Opus 4，4.1 的前代版本。",
@@ -578,7 +580,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="claude-opus-4-5-20251101",
         name="Claude Opus 4.5",
         provider="anyrouter",
-        probe_mode="none",
         context_length=200000,
         description="Anthropic Claude Opus 4.5, enhanced reasoning variant.",
         description_cn="Anthropic Claude Opus 4.5，增强推理变体。",
@@ -591,7 +592,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="claude-opus-4-6",
         name="Claude Opus 4-6",
         provider="anyrouter",
-        probe_mode="none",
         context_length=200000,
         description="Anthropic Claude Opus 4-6, latest Opus generation.",
         description_cn="Anthropic Claude Opus 4-6，最新 Opus 世代。",
@@ -604,7 +604,6 @@ STATIC_MODELS: list[ModelConfig] = [
         id="gemini-2.5-pro",
         name="Gemini 2.5 Pro",
         provider="anyrouter",
-        probe_mode="none",
         context_length=1000000,
         description="Google Gemini 2.5 Pro with 1M context and strong multimodal capabilities.",
         description_cn="Google Gemini 2.5 Pro，100万上下文，强大多模态能力。",
@@ -937,6 +936,12 @@ STATIC_MODELS: list[ModelConfig] = [
 
 def get_provider_config(key: str) -> ProviderConfig | None:
     return PROVIDERS.get(key)
+
+
+def provider_enabled(key: str) -> bool:
+    """False for unknown providers too, so callers cannot probe what they cannot name."""
+    provider = PROVIDERS.get(key)
+    return provider is not None and provider.enabled
 
 
 def get_static_models() -> list[ModelConfig]:
