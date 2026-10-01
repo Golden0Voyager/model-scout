@@ -30,27 +30,26 @@ class ProbeResult:
 class HealthChecker:
     def __init__(self, proxy: str | None = None):
         self._proxy = proxy
-        self._proxy_client: httpx.AsyncClient | None = None
-        self._direct_client: httpx.AsyncClient | None = None
+        # trust_env=False keeps routing decisions with the provider's `network` field:
+        # with it left on, an ambient HTTPS_PROXY would silently pull the "direct"
+        # (domestic) providers through the overseas proxy as well.
+        self._proxy_client: httpx.AsyncClient = httpx.AsyncClient(
+            proxy=proxy, timeout=15.0, follow_redirects=True, trust_env=False
+        )
+        self._direct_client: httpx.AsyncClient = httpx.AsyncClient(
+            timeout=15.0, follow_redirects=True, trust_env=False
+        )
         self._openai_clients: dict[str, AsyncOpenAI] = {}
         # Cache for provider model lists: provider_key -> (fetch_time_ms, models_set, latency_ms)
         self._models_cache: dict[str, tuple[int, set, int | None]] = {}
         self._cache_ttl_ms = 30000  # 30s cache for models endpoint
 
-    async def __aenter__(self):
-        self._proxy_client = httpx.AsyncClient(
-            proxy=self._proxy, timeout=15.0, follow_redirects=True
-        )
-        self._direct_client = httpx.AsyncClient(
-            timeout=15.0, follow_redirects=True
-        )
+    async def __aenter__(self) -> "HealthChecker":
         return self
 
-    async def __aexit__(self, *args):
-        if self._proxy_client:
-            await self._proxy_client.aclose()
-        if self._direct_client:
-            await self._direct_client.aclose()
+    async def __aexit__(self, *args) -> None:
+        await self._proxy_client.aclose()
+        await self._direct_client.aclose()
         for client in self._openai_clients.values():
             await client.close()
         self._models_cache.clear()
@@ -58,8 +57,14 @@ class HealthChecker:
     def _get_http_client(self, provider: ProviderConfig) -> httpx.AsyncClient:
         return self._direct_client if provider.network == "direct" else self._proxy_client
 
-    def _get_auth_headers(self, provider: ProviderConfig) -> dict[str, str]:
-        api_key = os.getenv(provider.api_key_env, "")
+    def _api_key(self, provider: ProviderConfig) -> str | None:
+        """Return a usable key, or None when unset or left as a template placeholder."""
+        value = os.getenv(provider.api_key_env, "").strip()
+        if not value or value in ("***", "YOUR_API_KEY", "placeholder"):
+            return None
+        return value
+
+    def _get_auth_headers(self, provider: ProviderConfig, api_key: str) -> dict[str, str]:
         if provider.auth_style == "api_key":
             return {"api-key": api_key}
         return {"Authorization": f"Bearer {api_key}"}
@@ -68,7 +73,7 @@ class HealthChecker:
         if provider.key in self._openai_clients:
             return self._openai_clients[provider.key]
 
-        api_key = os.getenv(provider.api_key_env)
+        api_key = self._api_key(provider)
         if not api_key:
             return None
 
@@ -95,9 +100,13 @@ class HealthChecker:
             if now - cached_time < self._cache_ttl_ms:
                 return cached_set, cached_latency, None
 
+        api_key = self._api_key(provider)
+        if api_key is None:
+            return None, None, f"no API key ({provider.api_key_env})"
+
         client = self._get_http_client(provider)
         url = f"{provider.base_url}{provider.models_endpoint}"
-        headers = self._get_auth_headers(provider)
+        headers = self._get_auth_headers(provider, api_key)
 
         start = time.perf_counter()
         try:
@@ -126,8 +135,8 @@ class HealthChecker:
                 error_message=f"Unknown provider: {provider_key}",
             )
 
-        api_key = os.getenv(provider.api_key_env)
-        if not api_key or api_key.strip() in ("", "***", "YOUR_API_KEY", "placeholder"):
+        api_key = self._api_key(provider)
+        if api_key is None:
             return ProbeResult(
                 model_id=model_id,
                 provider=provider_key,
@@ -266,9 +275,13 @@ class HealthChecker:
 
     async def _fetch_provider_models_raw(self, provider: ProviderConfig) -> tuple[list[dict[str, Any]] | None, str | None]:
         """Fetch the provider's raw model list (with metadata). No caching."""
+        api_key = self._api_key(provider)
+        if api_key is None:
+            return None, f"no API key ({provider.api_key_env})"
+
         client = self._get_http_client(provider)
         url = f"{provider.base_url}{provider.models_endpoint}"
-        headers = self._get_auth_headers(provider)
+        headers = self._get_auth_headers(provider, api_key)
         try:
             response = await client.get(url, headers=headers)
             if response.status_code == 200:

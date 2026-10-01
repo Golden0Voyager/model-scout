@@ -6,20 +6,19 @@
 # Get script directory (works regardless of cwd)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Proxy disabled — user is abroad, direct access to all providers
-# Uncomment below if you need proxy for specific providers:
-# export http_proxy=http://127.0.0.1:7897
-# export https_proxy=http://127.0.0.1:7897
-# export all_proxy=socks5://127.0.0.1:7897
-# export no_proxy=localhost,127.0.0.1,::1
+# Proxy: providers marked network="proxy" in backend/core/config.py route through it.
+# MODELSCOUT_PROXY_URL wins; the app otherwise falls back to https_proxy/http_proxy.
+# Uncomment and point at your local listener if overseas providers show as unreachable:
+# export MODELSCOUT_PROXY_URL=http://127.0.0.1:7897
 
-# Load user env (API keys)
+# Load user env (API keys, and proxy settings if you keep them in your shell config)
 if [ -f ~/.zshrc ]; then
     source ~/.zshrc >/dev/null 2>&1
 fi
 
-# Ensure no proxy leaks from shell config (user is abroad, direct access)
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+# The dashboard talks to the local backend directly — never through the proxy.
+export no_proxy="${no_proxy:+$no_proxy,}localhost,127.0.0.1,::1"
+export NO_PROXY="$no_proxy"
 
 export PATH="/Users/hainingyu/.local/bin:$PATH"
 
@@ -32,7 +31,8 @@ sleep 1
 # 1. Start Backend
 echo "🚀 Starting ModelScout Backend..."
 cd "$SCRIPT_DIR/backend"
-PYTHONPATH=. uv run python app.py > "$SCRIPT_DIR/backend.log" 2>&1 &
+# PYTHONUNBUFFERED so backend.log updates live instead of on block-buffer flush.
+PYTHONPATH=. PYTHONUNBUFFERED=1 uv run --frozen python app.py > "$SCRIPT_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 echo "✓ Backend started on port 8000 (PID: $BACKEND_PID)"
 
