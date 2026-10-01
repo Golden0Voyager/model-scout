@@ -81,7 +81,7 @@ async def get_health_for_provider(provider: str) -> list[dict[str, Any]]:
             return [dict(row) for row in rows]
 
 
-async def log_scan_start() -> int:
+async def log_scan_start() -> int | None:
     now = datetime.now(UTC).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -92,8 +92,10 @@ async def log_scan_start() -> int:
 
 
 async def log_scan_finish(
-    scan_id: int, models_checked: int, models_online: int, error: str | None = None
+    scan_id: int | None, models_checked: int, models_online: int, error: str | None = None
 ) -> None:
+    if scan_id is None:
+        return
     now = datetime.now(UTC).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -121,9 +123,8 @@ async def get_scan_stats() -> dict[str, Any]:
             "SELECT COUNT(*), SUM(models_online) FROM scan_log WHERE finished_at IS NOT NULL"
         ) as cursor:
             row = await cursor.fetchone()
-            total_scans = row[0] or 0
-            total_online_ever = row[1] or 0
+        total_scans, total_online_ever = (row[0], row[1]) if row else (0, 0)
         return {
-            "total_scans": total_scans,
-            "total_online_ever": total_online_ever,
+            "total_scans": total_scans or 0,
+            "total_online_ever": total_online_ever or 0,
         }
