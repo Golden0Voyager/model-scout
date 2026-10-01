@@ -90,4 +90,6 @@ cd frontend && npm run lint && npx tsc --noEmit
 - **模型缓存**：同一供应商的 models 列表在 30s TTL 内只请求一次，缓存在 `HealthChecker._models_cache`
 - **后台刷新**：启动时自动全量扫描，之后每 5 分钟（`SCAN_INTERVAL_MINUTES`）后台自动刷新
 - **状态颜色**：在线(绿) / 离线(红) / 异常(黄) / 未配置(灰) / 未知(蓝)
-- **AnyRouter**：上游端点当前不可达，`probe_mode="none"` 让它只作目录展示、不参与探测；端点恢复后删掉该字段即可
+- **provider 开关**：`ProviderConfig.enabled=False` 会让该 provider 既不发现也不探测，但目录条目仍完整显示为「未探测」。当前关闭的是 `anyrouter`（端点两条路都不通）、`agentrouter` 和 `mimo`（Token Plan，`/models` 返回 401 即 key 失效）。恢复时把 `enabled` 改回 `True` 即可，无需逐行改模型
+- **`probe_mode="none"`**：仍然支持的**模型级**开关，但目前没有任何静态条目使用它——三个坏掉的 provider 都改用上面的 provider 级开关
+- **被禁用的 provider 无法定向扫描**：`POST /api/scan/{provider}` 与单模型扫描会返回 409，全量扫描则直接跳过它们
