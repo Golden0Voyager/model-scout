@@ -40,6 +40,9 @@ class ProviderConfig:
     models_endpoint: str | None = None
     # Whether to auto-discover and add new models not in STATIC_MODELS
     auto_discover: bool = False
+    # /models returns per-model metadata (context, modalities, features, pricing)
+    # rather than bare IDs
+    rich_discovery: bool = False
     # Auth style: "bearer" (default, Authorization: Bearer <key>) or "api_key" (api-key: <key>)
     auth_style: str = "bearer"
 
@@ -146,6 +149,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         discovery="dynamic",
         models_endpoint="/models",
         auto_discover=True,
+        rich_discovery=True,
     ),
     "kimi_coding_plan": ProviderConfig(
         key="kimi_coding_plan",
@@ -210,12 +214,13 @@ PROVIDERS: dict[str, ProviderConfig] = {
     "sensenova": ProviderConfig(
         key="sensenova",
         name="SenseNova",
-        base_url="https://api.sensenova.cn/compatible-mode/v1",
+        base_url="https://token.sensenova.cn/v1",
         api_key_env="SENSENOVA_API_KEY",
         network="direct",
         discovery="dynamic",
         models_endpoint="/models",
         auto_discover=True,
+        rich_discovery=True,
     ),
 }
 
@@ -924,61 +929,9 @@ STATIC_MODELS: list[ModelConfig] = [
     ),
 
     # ===== SenseNova (商汤日日新) =====
-    ModelConfig(
-        id="DeepSeek-R1",
-        name="DeepSeek R1",
-        provider="sensenova",
-        context_length=8000,
-        description="SenseNova DeepSeek-R1. Native reasoning model, strongest math and logic capabilities.",
-        description_cn="商汤 DeepSeek-R1，原生推理模型，数学和逻辑推理能力最强。",
-        capabilities=["chat", "reasoning"],
-        is_free=True,
-        pricing_note="限时免费至 2026-08-09",
-    ),
-    ModelConfig(
-        id="DeepSeek-V3-1",
-        name="DeepSeek V3.1",
-        provider="sensenova",
-        context_length=32000,
-        description="SenseNova DeepSeek-V3-1. General-purpose chat model, best for most tasks.",
-        description_cn="商汤 DeepSeek-V3-1，通用对话模型，大多数任务首选。",
-        capabilities=["chat", "coding"],
-        is_free=True,
-        pricing_note="限时免费至 2026-08-09",
-    ),
-    ModelConfig(
-        id="DeepSeek-V3",
-        name="DeepSeek V3",
-        provider="sensenova",
-        context_length=32000,
-        description="SenseNova DeepSeek-V3. Previous generation general-purpose model.",
-        description_cn="商汤 DeepSeek-V3，上一代通用对话模型。",
-        capabilities=["chat", "coding"],
-        is_free=True,
-        pricing_note="限时免费至 2026-08-09",
-    ),
-    ModelConfig(
-        id="DeepSeek-R1-Distill-Qwen-32B",
-        name="DeepSeek R1 Distill Qwen 32B",
-        provider="sensenova",
-        context_length=8000,
-        description="SenseNova DeepSeek-R1 Distill Qwen 32B. Distilled reasoning model, balanced performance.",
-        description_cn="商汤 DeepSeek-R1 蒸馏版 Qwen 32B，平衡推理能力和成本。",
-        capabilities=["chat", "reasoning"],
-        is_free=True,
-        pricing_note="永久免费",
-    ),
-    ModelConfig(
-        id="DeepSeek-R1-Distill-Qwen-14B",
-        name="DeepSeek R1 Distill Qwen 14B",
-        provider="sensenova",
-        context_length=32000,
-        description="SenseNova DeepSeek-R1 Distill Qwen 14B. Lightweight distilled reasoning model.",
-        description_cn="商汤 DeepSeek-R1 蒸馏版 Qwen 14B，轻量推理模型。",
-        capabilities=["chat", "reasoning"],
-        is_free=True,
-        pricing_note="永久免费",
-    ),
+    # No static rows: the provider retired its whole hosted-DeepSeek list when it
+    # moved to token.sensenova.cn, and /models now serves nine first-party models
+    # that carry their own context, modality and feature metadata.
 ]
 
 

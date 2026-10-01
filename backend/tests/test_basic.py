@@ -29,7 +29,13 @@ from core.access import (
     is_trusted_origin,
     probe_limiter,
 )
-from core.config import PROVIDERS, STATIC_MODELS, get_provider_config, get_static_models
+from core.config import (
+    PROVIDERS,
+    STATIC_MODELS,
+    get_models_for_provider,
+    get_provider_config,
+    get_static_models,
+)
 from services.health_checker import HealthChecker, ProbeResult
 from services.sync_service import SyncService
 
@@ -77,6 +83,122 @@ def _client(service: SyncService | None) -> TestClient:
     app.include_router(router, prefix="/api")
     api.routes.sync_service = service
     return TestClient(app)
+
+
+def _service_with_payload(
+    payload: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> SyncService:
+    """A SyncService whose providers all answer /models with the given catalog.
+
+    Keys must exist for the providers under test, since discovery short-circuits on a
+    missing key rather than sending an empty Authorization header.
+    """
+    for env_name in ("MOONSHOT_API_KEY", "SENSENOVA_API_KEY"):
+        monkeypatch.setenv(env_name, "test-key")
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json=payload)
+    )
+    service = SyncService()
+    checker = HealthChecker()
+    checker._direct_client = httpx.AsyncClient(transport=transport)
+    checker._proxy_client = httpx.AsyncClient(transport=transport)
+    service._checker = checker
+    return service
+
+
+# SenseNova publishes OpenRouter-shaped metadata; sampled from the live endpoint.
+RICH_CATALOG: dict[str, Any] = {
+    "data": [
+        {
+            "id": "sensenova-6.8-flash-lite",
+            "name": "sensenova-6.8-flash-lite",
+            "context_length": 262144,
+            "max_output_length": 65536,
+            "input_modalities": ["text", "image"],
+            "output_modalities": ["text"],
+            "supported_features": ["tools", "json_mode", "reasoning"],
+            "pricing": {"prompt": "0", "completion": "0"},
+            "description": "Lightweight multimodal agent model.",
+        },
+        {
+            "id": "deepseek-v4-pro",
+            "name": "deepseek-v4-pro",
+            "context_length": 1048576,
+            "max_output_length": 65536,
+            "input_modalities": ["text"],
+            "supported_features": ["tools", "reasoning"],
+            "pricing": {"prompt": "0.02", "completion": "0.05"},
+        },
+    ]
+}
+
+
+# ---------------------------------------------------------------- provider config
+
+
+def test_sensenova_uses_the_live_token_endpoint() -> None:
+    provider = get_provider_config("sensenova")
+    assert provider is not None
+    assert provider.base_url == "https://token.sensenova.cn/v1"
+    assert provider.rich_discovery is True
+
+
+def test_retired_sensenova_catalog_is_not_pinned_in_config() -> None:
+    """The hosted-DeepSeek list disappeared with the old endpoint; nothing should pin it."""
+    assert [m.id for m in get_models_for_provider("sensenova")] == []
+
+
+def test_rich_discovery_drives_metadata_not_provider_names() -> None:
+    """The rich path must be selected by config, not by an `if provider_key == ...` arm."""
+    import inspect
+
+    import services.sync_service as module
+
+    source = inspect.getsource(module.SyncService._refresh_discovered_models)
+    assert 'provider_key == "moonshot"' not in source
+    for key in ("moonshot", "sensenova"):
+        provider = PROVIDERS[key]
+        assert provider.rich_discovery is True
+
+
+# ---------------------------------------------------------------- discovery mapping
+
+
+def test_rich_catalog_populates_every_advertised_field(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _service_with_payload(RICH_CATALOG, monkeypatch)
+    asyncio.run(service._refresh_discovered_models())
+
+    by_id = {m.id: m for m in service._discovered_models if m.provider == "sensenova"}
+    lite = by_id["sensenova-6.8-flash-lite"]
+    assert lite.context_length == 262144
+    assert lite.max_output_tokens == 65536
+    assert set(lite.capabilities) == {"chat", "vision", "function_calling", "reasoning"}
+    assert "long_context" not in lite.capabilities
+    assert lite.is_free is True
+    assert lite.description == "Lightweight multimodal agent model."
+
+    pro = by_id["deepseek-v4-pro"]
+    assert pro.capabilities.count("long_context") == 1
+    assert "vision" not in pro.capabilities
+    assert pro.is_free is False
+    assert pro.pricing_input_per_1m == 20_000.0
+    assert pro.pricing_output_per_1m == 50_000.0
+
+
+def test_unknown_features_do_not_leak_raw_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """json_mode has no dashboard label, so it must not surface as a raw snake_case tag."""
+    service = _service_with_payload(RICH_CATALOG, monkeypatch)
+    asyncio.run(service._refresh_discovered_models())
+    caps = {c for m in service._discovered_models for c in m.capabilities}
+    assert "json_mode" not in caps
+    assert not any("_" in c and c not in {"function_calling", "long_context"} for c in caps)
+
+
+def test_moonshot_still_discovers_through_the_generalised_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _service_with_payload(RICH_CATALOG, monkeypatch)
+    asyncio.run(service._refresh_discovered_models())
+    moonshot = [m for m in service._discovered_models if m.provider == "moonshot"]
+    assert {m.id for m in moonshot} == {"sensenova-6.8-flash-lite", "deepseek-v4-pro"}
 
 
 # ---------------------------------------------------------------- configuration
