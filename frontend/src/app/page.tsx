@@ -232,7 +232,7 @@ export default function Home() {
         setExpandedProviders(new Set());
         hasInit.current = true;
       }
-    } catch (e) {
+    } catch {
       setError("Backend connection failed");
     }
   }, []);
@@ -810,8 +810,8 @@ function ProviderGroup({
   onRefresh,
   children,
 }: {
-  provider: any;
-  sortKey: string;
+  provider: ProviderSummary;
+  sortKey: ProviderSortKey;
   isExpanded: boolean;
   onToggle: () => void;
   isScanning?: boolean;
@@ -820,10 +820,11 @@ function ProviderGroup({
 }) {
   const isManual = sortKey === "manual";
   const sortable = useSortable({ id: provider.key, disabled: !isManual });
+  const inactive: Partial<ReturnType<typeof useSortable>> = {};
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = isManual
     ? sortable
-    : ({} as any);
-  const style = isManual ? { transform: CSS.Transform.toString(transform), transition } : {};
+    : inactive;
+  const style = isManual ? { transform: CSS.Transform.toString(transform ?? null), transition } : {};
   const color = PROVIDER_COLORS[provider.key] || "#6366f1";
 
   return (

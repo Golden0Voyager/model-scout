@@ -12,7 +12,6 @@ import {
   HelpCircle,
   Key,
   Database,
-  Zap,
   Clock,
   Server,
   AlertCircle,

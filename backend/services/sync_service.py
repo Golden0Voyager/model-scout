@@ -1,5 +1,8 @@
 """Orchestrates model discovery and health checks."""
 
+import asyncio
+import time
+from collections.abc import Coroutine
 from datetime import UTC, datetime
 from typing import Any
 
@@ -14,6 +17,9 @@ from core.database import (
 )
 from services.health_checker import HealthChecker, ProbeResult
 
+# Guards against cost amplification: each full scan spends real inference requests.
+MIN_SCAN_INTERVAL_SECONDS = 20.0
+
 
 class SyncService:
     def __init__(self, proxy: str | None = None):
@@ -23,6 +29,24 @@ class SyncService:
         self._checker: HealthChecker | None = None
         self._discovered_models: list[ModelConfig] = []
         self._discovered_at: datetime | None = None
+        self._scan_lock = asyncio.Lock()
+        self._last_scan_started = 0.0
+        self._background_scan: asyncio.Task[None] | None = None
+
+    async def acquire_scan(self) -> str | None:
+        """Atomically claim the single scan slot. Returns None on success, else a verdict."""
+        async with self._scan_lock:
+            if self.is_scanning:
+                return "already_scanning"
+            remaining = MIN_SCAN_INTERVAL_SECONDS - (time.monotonic() - self._last_scan_started)
+            if remaining > 0:
+                return f"cooldown:{int(remaining) + 1}s"
+            self.is_scanning = True
+            self._last_scan_started = time.monotonic()
+            return None
+
+    def release_scan(self) -> None:
+        self.is_scanning = False
 
     def _get_all_models(self) -> list[ModelConfig]:
         """Return static + discovered models."""
@@ -153,15 +177,69 @@ class SyncService:
         await self._checker.__aenter__()
 
     async def shutdown(self) -> None:
+        if self._background_scan and not self._background_scan.done():
+            self._background_scan.cancel()
+            await asyncio.gather(self._background_scan, return_exceptions=True)
         if self._checker:
             await self._checker.__aexit__(None, None, None)
 
     async def run_sync(self) -> dict[str, Any]:
-        """Full sync: probe all configured models."""
-        if self.is_scanning:
-            return {"status": "already_scanning"}
+        """Full sync: probe all configured models. No-ops if the scan slot is taken."""
+        verdict = await self.acquire_scan()
+        if verdict is not None:
+            return {"status": verdict}
+        try:
+            return await self._execute_scan()
+        finally:
+            self.release_scan()
 
-        self.is_scanning = True
+    def _spawn_scan(self, label: str, work: Coroutine[Any, Any, Any]) -> None:
+        """Run an already-claimed scan in the background, releasing the slot when done."""
+
+        async def _runner() -> None:
+            try:
+                print(f"✅ {label}: {await work}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"❌ {label} failed: {e}")
+            finally:
+                self.release_scan()
+
+        self._background_scan = asyncio.create_task(_runner())
+
+    async def start_scan(self) -> str | None:
+        """Claim the scan slot and run a full scan in the background; returns a verdict or None."""
+        verdict = await self.acquire_scan()
+        if verdict is not None:
+            return verdict
+        self._spawn_scan("Scan", self._execute_scan())
+        return None
+
+    async def start_provider_scan(self, provider_key: str) -> str | None:
+        """Probe one provider in the background; returns a verdict or None when started."""
+        checker = self._checker
+        if checker is None:
+            return "service_not_initialized"
+
+        models = [m for m in self._get_all_models() if m.provider == provider_key and m.probe_mode != "none"]
+        if not models:
+            return f"no_probeable_models:{provider_key}"
+
+        verdict = await self.acquire_scan()
+        if verdict is not None:
+            return verdict
+        self._spawn_scan(
+            f"Provider scan {provider_key}",
+            self._probe_provider_models(provider_key, models, checker),
+        )
+        return None
+
+    async def _execute_scan(self) -> dict[str, Any]:
+        checker = self._checker
+        if checker is None:
+            return {"status": "error", "message": "Health checker not initialized"}
+
         scan_id = await log_scan_start()
         start_time = datetime.now(UTC)
 
@@ -174,7 +252,7 @@ class SyncService:
             skipped = [m for m in models if m.probe_mode == "none"]
 
             print(f"🔍 Starting health check for {len(probes)} models ({len(skipped)} skipped)...")
-            results: list[ProbeResult] = await self._checker.probe_batch(probes, concurrency=6)
+            results: list[ProbeResult] = await checker.probe_batch(probes, concurrency=6)
 
             online_count = 0
             for r in results:
@@ -219,9 +297,6 @@ class SyncService:
             print(f"❌ Sync failed: {e}")
             return {"status": "error", "message": str(e)}
 
-        finally:
-            self.is_scanning = False
-
     async def probe_single_model(self, model_id: str, provider_key: str) -> ProbeResult:
         """Probe a single model and persist result."""
         if not self._checker:
@@ -240,21 +315,11 @@ class SyncService:
         })
         return result
 
-    async def probe_provider(self, provider_key: str) -> dict[str, Any]:
-        """Probe all models for a single provider."""
-        if not self._checker:
-            return {"status": "error", "message": "Health checker not initialized"}
-
-        provider = get_provider_config(provider_key)
-        if not provider:
-            return {"status": "error", "message": f"Unknown provider: {provider_key}"}
-
-        models = [m for m in self._get_all_models() if m.provider == provider_key and m.probe_mode != "none"]
-        if not models:
-            return {"status": "error", "message": f"No probe-able models found for {provider_key}"}
-
+    async def _probe_provider_models(
+        self, provider_key: str, models: list[ModelConfig], checker: HealthChecker
+    ) -> dict[str, Any]:
         probes = [{"model_id": m.id, "provider": m.provider} for m in models]
-        results = await self._checker.probe_batch(probes, concurrency=6)
+        results = await checker.probe_batch(probes, concurrency=6)
 
         online_count = 0
         for r in results:
@@ -277,11 +342,11 @@ class SyncService:
         }
 
     async def get_dashboard_data(self) -> dict[str, Any]:
-        """Combine static model catalog with latest health data."""
-        # Refresh discovered models if we have none yet
-        if not self._discovered_models and self._checker:
-            await self._refresh_discovered_models()
+        """Combine the model catalog with the latest persisted health data.
 
+        Read-only by design: discovery and probing are driven by the scheduler and
+        explicit scan requests, never by a dashboard poll.
+        """
         models = self._get_all_models()
         health_rows = await get_all_health()
         health_map: dict[str, dict[str, Any]] = {

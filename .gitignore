@@ -2,9 +2,12 @@
 __pycache__/
 .venv/
 *.log
+.coverage
 node_modules/
 *.db
 .DS_Store
+# git-feature worktrees
+.worktrees/
 # Skill-generated analysis artifacts
 .understand-anything/
 .codegraph/

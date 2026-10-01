@@ -11,6 +11,7 @@ import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -18,19 +19,44 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import api.routes
 from api.routes import router
+from core.config import PROVIDERS
 from services.sync_service import SyncService
 
 load_dotenv()
 
-# Clear proxy env vars — user is abroad, direct access to all providers
-for _p in ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-    os.environ.pop(_p, None)
 
-# Verify key loading (prefixes only, for debugging)
-for _env_key in ["GROQ_API_KEY", "DASHSCOPE_API_KEY", "DEEPSEEK_API_KEY", "OPENROUTER_API_KEY", "GEMINI_API_KEY", "SENSENOVA_API_KEY"]:
-    _val = os.getenv(_env_key, "NOT_SET")
-    _prefix = _val[:10] if len(_val) > 10 else _val
-    print(f"[env] {_env_key}: {_prefix}...")
+def _proxy_label(url: str) -> str:
+    """Return scheme://host:port, dropping any credentials embedded in the URL."""
+    parsed = urlsplit(url)
+    host = parsed.hostname or "?"
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return f"{parsed.scheme or 'http'}://{host}"
+
+
+def _resolve_proxy_url() -> str | None:
+    """Proxy used for providers marked network="proxy".
+
+    MODELSCOUT_PROXY_URL wins; the ambient *_proxy names are only a fallback, and
+    reading them here is safe because HealthChecker builds every client with
+    trust_env=False, so httpx cannot apply them to the direct pool as well.
+    """
+    explicit = os.getenv("MODELSCOUT_PROXY_URL", "").strip()
+    if explicit:
+        return explicit
+    for name in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+# Report key presence only — never print key material, this output is logged to backend.log.
+_KEY_ENVS = sorted({p.api_key_env for p in PROVIDERS.values()})
+_missing_keys = [k for k in _KEY_ENVS if not os.getenv(k, "").strip()]
+print(f"[env] API keys configured: {len(_KEY_ENVS) - len(_missing_keys)}/{len(_KEY_ENVS)}")
+if _missing_keys:
+    print(f"[env] missing: {', '.join(_missing_keys)}")
 
 DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "5"))
@@ -58,15 +84,23 @@ async def _scheduled_scan_loop(service: SyncService):
 async def lifespan(app: FastAPI):
     global _scan_task
 
-    proxy = os.getenv("https_proxy") or os.getenv("http_proxy")
-    service = SyncService(proxy=proxy)
+    proxy_url = _resolve_proxy_url()
+    proxied = [p.name for p in PROVIDERS.values() if p.network == "proxy"]
+    if proxy_url:
+        print(f"[net] proxy enabled for {len(proxied)} providers: {_proxy_label(proxy_url)}")
+    else:
+        print(f"[net] no proxy configured; marked unreachable: {', '.join(proxied)}")
+
+    service = SyncService(proxy=proxy_url)
     await service.initialize()
 
     # Wire routes
     api.routes.sync_service = service
 
     # Initial scan on startup
-    asyncio.create_task(service.run_sync())
+    verdict = await service.start_scan()
+    if verdict is not None:
+        print(f"[scheduler] Startup scan skipped: {verdict}")
 
     # Start scheduler
     _scan_task = asyncio.create_task(_scheduled_scan_loop(service))

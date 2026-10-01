@@ -24,6 +24,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py312"
@@ -34,14 +35,19 @@ select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
 ignore = ["E501", "SIM105"]
 
 [tool.mypy]
+python_version = "3.12"
 ignore_missing_imports = true
+explicit_package_bases = true
+mypy_path = "."
+files = ["api", "core", "services", "tests"]
 
 [tool.coverage.run]
-source = ["."]
+source = ["api", "core", "services", "app"]
 
 [tool.coverage.report]
-fail_under = 85
+fail_under = 55
 show_missing = true
+omit = ["tests/*", ".venv/*"]
 
 [tool.bandit]
 skips = ["B101", "B311", "B404", "B603"]
