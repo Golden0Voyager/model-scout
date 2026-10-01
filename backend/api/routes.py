@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.access import PROBE_MAX_CALLS, PROBE_WINDOW_SECONDS, probe_limiter, require_trusted_origin
-from core.config import get_provider_config
+from core.config import get_provider_config, provider_enabled
 from core.models import DashboardResponse, ScanTriggerResponse
 from services.sync_service import SyncService
 
@@ -42,6 +42,11 @@ def _rejected(verdict: str) -> ScanTriggerResponse:
 def _require_provider(provider_key: str) -> None:
     if get_provider_config(provider_key) is None:
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider_key}")
+    if not provider_enabled(provider_key):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Provider '{provider_key}' is disabled in core/config.py",
+        )
 
 
 def _enforce_probe_limit() -> None:

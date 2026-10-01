@@ -6,7 +6,7 @@ from collections.abc import Coroutine
 from datetime import UTC, datetime
 from typing import Any
 
-from core.config import ModelConfig, get_provider_config, get_static_models
+from core.config import ModelConfig, get_provider_config, get_static_models, provider_enabled
 from core.database import (
     get_all_health,
     get_last_scan_time,
@@ -68,6 +68,8 @@ class SyncService:
         static_keys = {(m.provider, m.id) for m in get_static_models()}
 
         for provider_key, provider in PROVIDERS.items():
+            if not provider.enabled:
+                continue
             if provider.discovery != "dynamic" or not provider.models_endpoint or not provider.auto_discover:
                 continue
 
@@ -253,8 +255,14 @@ class SyncService:
             await self._refresh_discovered_models()
 
             models = self._get_all_models()
-            probes = [{"model_id": m.id, "provider": m.provider} for m in models if m.probe_mode != "none"]
-            skipped = [m for m in models if m.probe_mode == "none"]
+            probeable: list[ModelConfig] = []
+            skipped: list[ModelConfig] = []
+            for m in models:
+                if m.probe_mode == "none" or not provider_enabled(m.provider):
+                    skipped.append(m)
+                else:
+                    probeable.append(m)
+            probes = [{"model_id": m.id, "provider": m.provider} for m in probeable]
 
             print(f"🔍 Starting health check for {len(probes)} models ({len(skipped)} skipped)...")
             results: list[ProbeResult] = await checker.probe_batch(probes, concurrency=6)

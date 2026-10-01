@@ -35,6 +35,7 @@ from core.config import (
     get_models_for_provider,
     get_provider_config,
     get_static_models,
+    provider_enabled,
 )
 from services.health_checker import HealthChecker, ProbeResult
 from services.sync_service import SyncService
@@ -93,16 +94,21 @@ def _service_with_payload(
     Keys must exist for the providers under test, since discovery short-circuits on a
     missing key rather than sending an empty Authorization header.
     """
-    for env_name in ("MOONSHOT_API_KEY", "SENSENOVA_API_KEY"):
+    for env_name in ("MOONSHOT_API_KEY", "SENSENOVA_API_KEY", "AGENTROUTER_API_KEY", "MIMO_TOKEN_PLAN_KEY"):
         monkeypatch.setenv(env_name, "test-key")
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(200, json=payload)
-    )
+    recorded: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        recorded.append(str(request.url))
+        return httpx.Response(200, json=payload)
+
+    transport = httpx.MockTransport(handler)
     service = SyncService()
     checker = HealthChecker()
     checker._direct_client = httpx.AsyncClient(transport=transport)
     checker._proxy_client = httpx.AsyncClient(transport=transport)
     service._checker = checker
+    service.recorded_requests = recorded  # type: ignore[attr-defined]
     return service
 
 
@@ -199,6 +205,76 @@ def test_moonshot_still_discovers_through_the_generalised_path(monkeypatch: pyte
     asyncio.run(service._refresh_discovered_models())
     moonshot = [m for m in service._discovered_models if m.provider == "moonshot"]
     assert {m.id for m in moonshot} == {"sensenova-6.8-flash-lite", "deepseek-v4-pro"}
+
+
+# ---------------------------------------------------------------- provider switch
+
+DISABLED = {"agentrouter", "mimo", "anyrouter"}
+# Static catalog rows per disabled provider; discovery is switched off for all three,
+# so these counts also pin that disabling never empties the catalog.
+DISABLED_MODEL_COUNTS = {"anyrouter": 11, "agentrouter": 3, "mimo": 4}
+DISABLED_HOSTS = ("agentrouter.org", "token-plan-cn.xiaomimimo.com", "anyrouter.net")
+
+
+def test_the_three_dead_providers_are_switched_off() -> None:
+    assert {k for k, p in PROVIDERS.items() if not p.enabled} == DISABLED
+    assert provider_enabled("sensenova") is True
+    # An unknown key must not be probeable just because nobody declared it.
+    assert provider_enabled("not-a-provider") is False
+
+
+def test_provider_switch_replaced_the_per_model_flags() -> None:
+    """AnyRouter's 11 duplicated probe_mode rows must have collapsed into one switch."""
+    assert [m.id for m in get_static_models() if m.probe_mode == "none"] == []
+
+
+def test_discovery_never_contacts_a_disabled_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = _service_with_payload(RICH_CATALOG, monkeypatch)
+    asyncio.run(service._refresh_discovered_models())
+
+    contacted = {u for u in service.recorded_requests if any(h in u for h in DISABLED_HOSTS)}  # type: ignore[attr-defined]
+    assert contacted == set()
+    assert [m for m in service._discovered_models if m.provider in DISABLED] == []
+
+
+def test_scan_skips_every_model_of_a_disabled_provider() -> None:
+    requested: list[dict[str, str]] = []
+    service = _stub_service([])
+    assert service._checker is not None
+
+    async def fake_batch(
+        probes: list[dict[str, str]], concurrency: int = 8
+    ) -> list[ProbeResult]:
+        requested.extend(probes)
+        return []
+
+    service._checker.probe_batch = fake_batch  # type: ignore[method-assign]
+    asyncio.run(service.run_sync())
+
+    assert requested
+    assert [p for p in requested if p["provider"] in DISABLED] == []
+
+    rows = asyncio.run(database.get_all_health())
+    for key, count in DISABLED_MODEL_COUNTS.items():
+        own = [r for r in rows if r["provider"] == key]
+        assert len(own) == count, key
+        assert {r["status"] for r in own} == {"unknown"}
+        assert all("Probe disabled" in (r["error_message"] or "") for r in own)
+
+
+@pytest.mark.parametrize(
+    "path", ["/api/scan/agentrouter", "/api/scan/agentrouter/claude-opus-4-6"]
+)
+def test_scan_requests_against_a_disabled_provider_are_refused(path: str) -> None:
+    response = _client(_stub_service()).post(path)
+    assert response.status_code == 409
+    assert "disabled" in response.json()["detail"]
+
+
+def test_disabled_providers_stay_in_the_catalog() -> None:
+    """The panel reports which models exist; a dead key is not a reason to forget them."""
+    payload = _client(_stub_service()).get("/api/models").json()
+    assert {m["provider"] for m in payload["models"]} >= DISABLED
 
 
 # ---------------------------------------------------------------- configuration
@@ -548,29 +624,6 @@ def test_probe_reports_no_key_without_network(monkeypatch: pytest.MonkeyPatch) -
 # ---------------------------------------------------------------- probe scoping
 
 
-def test_scan_omits_models_with_probe_disabled() -> None:
-    """AnyRouter's upstream is down, so its catalog rows must never reach the probe batch."""
-    requested: list[dict[str, str]] = []
-    service = _stub_service([])
-    assert service._checker is not None
-
-    async def fake_batch(
-        probes: list[dict[str, str]], concurrency: int = 8
-    ) -> list[ProbeResult]:
-        requested.extend(probes)
-        return []
-
-    service._checker.probe_batch = fake_batch  # type: ignore[method-assign]
-    asyncio.run(service.run_sync())
-
-    assert requested, "expected the scan to probe the enabled models"
-    assert [p for p in requested if p["provider"] == "anyrouter"] == []
-
-    rows = asyncio.run(database.get_all_health())
-    anyrouter = [r for r in rows if r["provider"] == "anyrouter"]
-    assert len(anyrouter) == 11
-    assert {r["status"] for r in anyrouter} == {"unknown"}
-    assert all("Probe disabled" in (r["error_message"] or "") for r in anyrouter)
 
 
 # ---------------------------------------------------------------- access control
