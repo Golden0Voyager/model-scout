@@ -17,6 +17,8 @@ import {
   AlertCircle,
 } from "lucide-react";
 
+import { formatContext, formatPrice, latencyColor } from "../../lib/format";
+
 interface Health {
   status: string;
   latency_ms?: number;
@@ -59,32 +61,6 @@ const CAPABILITY_LABELS: Record<string, string> = {
   long_context: "Long Context",
   moE: "MoE",
 };
-
-const CNY_TO_USD = 7.2;
-
-function latencyColor(ms: number): string {
-  if (ms < 200) return "#22c55e";
-  if (ms < 500) return "#f59e0b";
-  if (ms < 1000) return "#f97316";
-  return "#ef4444";
-}
-
-function formatContext(n: number): string {
-  if (n >= 1000000) return `${(n / 1000000).toFixed(0)}M`;
-  if (n >= 1000) return `${(n / 1000).toFixed(0)}K`;
-  return `${n}`;
-}
-
-function formatPrice(input?: number, output?: number, currency?: string): string {
-  if (input == null || output == null) return "N/A";
-  const cny = currency === "CNY" || !currency;
-  if (cny) {
-    const inUsd = input / CNY_TO_USD;
-    const outUsd = output / CNY_TO_USD;
-    return `$${inUsd.toFixed(2)} / $${outUsd.toFixed(2)} per 1M tokens (¥${input.toFixed(2)} / ¥${output.toFixed(2)})`;
-  }
-  return `$${input.toFixed(2)} / $${output.toFixed(2)} per 1M tokens`;
-}
 
 function formatTimeFull(iso?: string): string {
   if (!iso) return "--";
@@ -249,7 +225,7 @@ export default function ModelModal({ model, onClose, onRefresh, isScanning }: Mo
               <div className="text-sm font-medium text-emerald-400">Free (rate limited)</div>
             ) : (
               <div className="text-sm text-slate-300">
-                {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency)}
+                {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency) ?? "N/A"}
               </div>
             )}
             {model.pricing_note && (

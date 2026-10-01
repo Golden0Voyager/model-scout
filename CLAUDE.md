@@ -50,6 +50,9 @@ npm run dev
 - 卡片/列表双视图切换
 - 供应商分组折叠、能力标签筛选、30 秒轮询
 - `components/ModelModal.tsx`：模型详情弹窗
+- `lib/format.ts`：`page.tsx` 与弹窗共用的展示层格式化函数（`formatPrice` / `formatContext` / `latencyColor`）与 `CNY_TO_USD` 汇率常量。汇率是写死的静态值，需要调整只改这一处
+
+`STATUS_META` 与 `CAPABILITY_LABELS` 目前仍在两个文件里各存一份，尚未收敛。
 
 ### 数据库
 

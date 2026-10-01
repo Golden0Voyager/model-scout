@@ -21,6 +21,7 @@ import api.routes
 from api.routes import router
 from core.access import ALLOWED_ORIGINS
 from core.config import PROVIDERS
+from core.database import close_db
 from services.sync_service import SyncService
 
 load_dotenv()
@@ -119,6 +120,7 @@ async def lifespan(app: FastAPI):
             pass
 
     await service.shutdown()
+    await close_db()
     print("👋 ModelScout shutdown complete")
 
 

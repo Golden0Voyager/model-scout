@@ -46,10 +46,13 @@ PROVIDER_KEYS = {p.api_key_env for p in PROVIDERS.values()}
 
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path):
+    """Point the pooled connection at a throwaway file for the duration of one test."""
     original = database.DB_PATH
+    asyncio.run(database.close_db())
     database.DB_PATH = str(tmp_path / "test.db")
     asyncio.run(database.init_db())
     yield database.DB_PATH
+    asyncio.run(database.close_db())
     database.DB_PATH = original
 
 
@@ -277,6 +280,90 @@ def test_disabled_providers_stay_in_the_catalog() -> None:
     assert {m["provider"] for m in payload["models"]} >= DISABLED
 
 
+# ---------------------------------------------------------------- catalogue caching
+
+
+def _counting_checker(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int = 200,
+    payload: dict[str, Any] | None = None,
+    delay: float = 0.0,
+) -> tuple[HealthChecker, list[str]]:
+    """A checker whose httpx clients record every request they make."""
+    recorded: list[str] = []
+    body: dict[str, Any] = payload if payload is not None else {"data": [{"id": "m0"}]}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        recorded.append(str(request.url))
+        if delay:
+            await asyncio.sleep(delay)
+        return httpx.Response(status, json=body)
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    checker = HealthChecker()
+    transport = httpx.MockTransport(handler)
+    checker._direct_client = httpx.AsyncClient(transport=transport)
+    checker._proxy_client = httpx.AsyncClient(transport=transport)
+    return checker, recorded
+
+
+def test_a_scan_fetches_a_provider_catalogue_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Measured regression: 40 models of one provider used to raise 6 duplicate requests."""
+    catalogue = {"data": [{"id": f"m{i}"} for i in range(40)]}
+    checker, urls = _counting_checker(monkeypatch, payload=catalogue)
+    probes = [{"model_id": f"m{i}", "provider": "openrouter"} for i in range(40)]
+
+    results = asyncio.run(checker.probe_batch(probes, concurrency=6))
+
+    assert [u for u in urls if u.endswith("/models")] == [urls[0]]
+    assert all(r.status == "online" for r in results)
+
+
+def test_concurrent_lookups_join_one_inflight_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, urls = _counting_checker(monkeypatch, delay=0.05)
+    provider = PROVIDERS["openrouter"]
+
+    async def scenario() -> list[Any]:
+        return list(await asyncio.gather(*(checker._fetch_provider_models(provider) for _ in range(20))))
+
+    snapshots = asyncio.run(scenario())
+    assert len(urls) == 1
+    assert all(snap[0] == {"m0"} for snap in snapshots)
+
+
+def test_a_failed_lookup_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Failures used to be re-fetched once per model, amplifying an outage 1:1 with size."""
+    checker, urls = _counting_checker(monkeypatch, status=500)
+    provider = PROVIDERS["openrouter"]
+
+    async def scenario() -> list[Any]:
+        return [await checker._fetch_provider_models(provider) for _ in range(10)]
+
+    snapshots = asyncio.run(scenario())
+    assert len(urls) == 1
+    assert all(snap[2] == "HTTP 500" for snap in snapshots)
+
+
+def test_reset_model_cache_forces_a_refetch(monkeypatch: pytest.MonkeyPatch) -> None:
+    checker, urls = _counting_checker(monkeypatch)
+    provider = PROVIDERS["openrouter"]
+
+    async def scenario() -> None:
+        await checker._fetch_provider_models(provider)
+        await checker._fetch_provider_models(provider)
+        checker.reset_model_cache()
+        await checker._fetch_provider_models(provider)
+
+    asyncio.run(scenario())
+    assert len(urls) == 2
+
+
+def test_cache_ttl_outlives_a_full_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The old 30s TTL expired during the ~40s scan it was meant to cover."""
+    checker, _ = _counting_checker(monkeypatch)
+    assert checker._cache_ttl_ms > 60_000
+
+
 # ---------------------------------------------------------------- configuration
 
 
@@ -334,6 +421,50 @@ def test_log_scan_finish_tolerates_missing_row() -> None:
         await database.init_db()
         await database.log_scan_finish(None, models_checked=0, models_online=0)
         assert await database.get_scan_stats() == {"total_scans": 0, "total_online_ever": 0}
+
+    asyncio.run(scenario())
+
+
+def test_connection_is_pooled_and_runs_in_wal() -> None:
+    async def scenario() -> None:
+        db = await database.get_db()
+        assert await database.get_db() is db
+        async with db.execute("PRAGMA journal_mode") as cursor:
+            mode = await cursor.fetchone()
+        assert mode is not None
+        assert str(mode[0]).lower() == "wal"
+        async with db.execute("PRAGMA busy_timeout") as cursor:
+            timeout = await cursor.fetchone()
+        assert timeout is not None
+        assert timeout[0] == 5000
+
+    asyncio.run(scenario())
+
+
+def test_close_db_forces_a_reconnect() -> None:
+    async def scenario() -> None:
+        before = await database.get_db()
+        await database.close_db()
+        assert await database.get_db() is not before
+        await database.upsert_health({"model_id": "m", "provider": "deepseek", "status": "online"})
+        assert len(await database.get_all_health()) == 1
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_writes_and_reads_do_not_deadlock() -> None:
+    """The regression: a scan persisting hundreds of rows while the dashboard polls."""
+
+    async def scenario() -> None:
+        writes = [
+            database.upsert_health(
+                {"model_id": f"m{i}", "provider": "scnet", "status": "online", "latency_ms": i}
+            )
+            for i in range(120)
+        ]
+        reads = [database.get_all_health(), database.get_scan_stats(), database.get_last_scan_time()]
+        await asyncio.gather(*writes, *reads)
+        assert len(await database.get_all_health()) == 120
 
     asyncio.run(scenario())
 
