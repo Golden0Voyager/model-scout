@@ -27,6 +27,25 @@ class ProbeResult:
     error_message: str | None = None
 
 
+# Only features the dashboard already knows how to label are translated; anything
+# else would render as a raw snake_case tag.
+_CAPABILITY_BY_FEATURE = {"tools": "function_calling", "reasoning": "reasoning"}
+
+
+def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
+    """Derive capability tags from whichever schema this provider publishes."""
+    capabilities = ["chat"]
+    if raw.get("supports_image_in") or "image" in (raw.get("input_modalities") or []):
+        capabilities.append("vision")
+    for feature in raw.get("supported_features") or []:
+        mapped = _CAPABILITY_BY_FEATURE.get(feature)
+        if mapped and mapped not in capabilities:
+            capabilities.append(mapped)
+    if context_length >= 1_000_000:
+        capabilities.append("long_context")
+    return capabilities
+
+
 class HealthChecker:
     def __init__(self, proxy: str | None = None):
         self._proxy = proxy
@@ -328,14 +347,16 @@ class HealthChecker:
                 "id": mid,
                 "name": m.get("name") or mid,
             }
-            # Moonshot metadata
-            if "context_length" in m:
-                info["context_length"] = m["context_length"]
-            if m.get("supports_image_in"):
-                info["capabilities"] = ["chat", "vision"]
-            else:
-                info["capabilities"] = ["chat"]
-            # OpenRouter pricing
+            context_length = int(m.get("context_length") or 0)
+            if context_length:
+                info["context_length"] = context_length
+            if m.get("max_output_length"):
+                info["max_output_tokens"] = int(m["max_output_length"])
+            if m.get("description"):
+                info["description"] = m["description"]
+            info["capabilities"] = _capabilities(m, context_length)
+            # OpenRouter-shaped pricing, also published by SenseNova. Values are USD
+            # per token, so scale to the per-1M unit the catalog stores.
             pricing = m.get("pricing")
             if isinstance(pricing, dict):
                 try:

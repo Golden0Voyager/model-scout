@@ -100,8 +100,8 @@ class SyncService:
                 print(f"🔎 {provider.name}: discovered {len(free_models)} free models")
                 continue
 
-            # Moonshot: detailed discovery with context_length and vision support
-            if provider_key == "moonshot":
+            # Providers whose /models carries per-model metadata (Moonshot, SenseNova).
+            if provider.rich_discovery:
                 models_info, error = await self._checker.discover_models_detailed(provider_key)
                 if not models_info:
                     if error:
@@ -115,10 +115,15 @@ class SyncService:
                         id=mid,
                         name=info.get("name", mid),
                         provider=provider_key,
-                        context_length=info.get("context_length", 128000),
-                        description=f"Auto-discovered from {provider.name}",
+                        context_length=info.get("context_length") or 128000,
+                        max_output_tokens=info.get("max_output_tokens"),
+                        description=info.get("description") or f"Auto-discovered from {provider.name}",
                         description_cn=f"从 {provider.name} 自动发现",
                         capabilities=info.get("capabilities", ["chat"]),
+                        pricing_input_per_1m=info.get("pricing_input_per_1m"),
+                        pricing_output_per_1m=info.get("pricing_output_per_1m"),
+                        pricing_currency="USD",
+                        is_free=bool(info.get("is_free")),
                         probe_mode="chat",
                     ))
                 print(f"🔎 {provider.name}: discovered {len(models_info)} models with metadata")
