@@ -40,6 +40,7 @@ npm run dev
 - **`core/database.py`**：aiosqlite 异步数据库操作，存储健康状态历史
 - **`services/health_checker.py`**：健康探测引擎。支持 models_endpoint 探测（免费）和 chat_ping（最小 token 成本），带 30s 缓存
 - **`services/sync_service.py`**：同步调度服务。`acquire_scan()` 提供原子扫描槽位，`MIN_SCAN_INTERVAL_SECONDS` 提供冷却，探测为 6 并发 + 150ms 间隔
+- **`core/access.py`**：扫描接口的访问控制。`ALLOWED_ORIGINS` 校验请求来源，`probe_limiter` 为单模型探测提供滑动窗口限流
 
 ### 前端（Next.js 16 + React 19 + Tailwind CSS v4）
 
@@ -83,6 +84,9 @@ cd frontend && npm run lint && npx tsc --noEmit
 
 - **代理路由**：`core/config.py` 的 `network` 字段决定走向——`proxy` 走 `MODELSCOUT_PROXY_URL`（海外供应商），`direct` 始终绕过代理（国内供应商）。两个 httpx 客户端都带 `trust_env=False`，防止环境里的 `*_proxy` 把 direct 组也卷进海外出口，不要移除
 - **只读接口不碰外网**：`GET /api/models` 只读 SQLite；模型发现仅由启动扫描、定时任务和显式 `POST /api/scan` 触发
+- **扫描接口来源校验**：三个 `POST /api/scan*` 走 `require_trusted_origin`。浏览器对跨源 POST 一定附带 `Origin`，因此不在白名单（含 `Origin: null`）即 403，无需向前端分发密钥。Next 的 rewrites 是服务端代理且会透传 `Origin`，所以前端链路同样受保护、也照常放行（已实测）。**不带 `Origin` 视为本地请求**：curl 和本地脚本本来就能读到 `.env` 里的全部密钥，给它们加令牌保护不了任何东西。若将来把服务绑到非回环地址，这套就不够了，需要真正的鉴权
+- **面板换端口时**：`ALLOWED_ORIGINS` 与 CORS 共用同一份常量，改端口要同时更新 `core/access.py` 和 `next.config.ts`
+- **单模型探测限流**：`POST /api/scan/{provider}/{model}` 每次都是一笔真实请求且不受扫描冷却约束，故独立限流为 30 次/60 秒，超限返回 429 并带 `Retry-After`
 - **模型缓存**：同一供应商的 models 列表在 30s TTL 内只请求一次，缓存在 `HealthChecker._models_cache`
 - **后台刷新**：启动时自动全量扫描，之后每 5 分钟（`SCAN_INTERVAL_MINUTES`）后台自动刷新
 - **状态颜色**：在线(绿) / 离线(红) / 异常(黄) / 未配置(灰) / 未知(蓝)

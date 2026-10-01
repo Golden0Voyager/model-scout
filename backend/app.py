@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 import api.routes
 from api.routes import router
+from core.access import ALLOWED_ORIGINS
 from core.config import PROVIDERS
 from services.sync_service import SyncService
 
@@ -135,10 +136,7 @@ if DEBUG:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=list(ALLOWED_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

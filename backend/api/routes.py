@@ -2,8 +2,9 @@
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from core.access import PROBE_MAX_CALLS, PROBE_WINDOW_SECONDS, probe_limiter, require_trusted_origin
 from core.config import get_provider_config
 from core.models import DashboardResponse, ScanTriggerResponse
 from services.sync_service import SyncService
@@ -43,6 +44,17 @@ def _require_provider(provider_key: str) -> None:
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider_key}")
 
 
+def _enforce_probe_limit() -> None:
+    """Per-model probes each spend one real request and bypass the scan slot."""
+    retry_after = probe_limiter.acquire()
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Probe rate limit reached ({PROBE_MAX_CALLS} per {int(PROBE_WINDOW_SECONDS)}s)",
+            headers={"Retry-After": str(int(retry_after) + 1)},
+        )
+
+
 @router.get("/models", response_model=DashboardResponse)
 async def get_models() -> dict[str, Any]:
     """Get all models with their current health status."""
@@ -59,7 +71,11 @@ async def get_model_detail(model_id: str) -> dict[str, Any]:
     raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
 
-@router.post("/scan", response_model=ScanTriggerResponse)
+@router.post(
+    "/scan",
+    response_model=ScanTriggerResponse,
+    dependencies=[Depends(require_trusted_origin)],
+)
 async def trigger_scan() -> ScanTriggerResponse:
     """Trigger a manual health check scan."""
     verdict = await _service().start_scan()
@@ -68,7 +84,11 @@ async def trigger_scan() -> ScanTriggerResponse:
     return ScanTriggerResponse(status="scan_started", message="Background scan initiated")
 
 
-@router.post("/scan/{provider_key}", response_model=ScanTriggerResponse)
+@router.post(
+    "/scan/{provider_key}",
+    response_model=ScanTriggerResponse,
+    dependencies=[Depends(require_trusted_origin)],
+)
 async def trigger_provider_scan(provider_key: str) -> ScanTriggerResponse:
     """Trigger health check for all models of a single provider."""
     _require_provider(provider_key)
@@ -80,10 +100,14 @@ async def trigger_provider_scan(provider_key: str) -> ScanTriggerResponse:
     )
 
 
-@router.post("/scan/{provider_key}/{model_id:path}")
+@router.post(
+    "/scan/{provider_key}/{model_id:path}",
+    dependencies=[Depends(require_trusted_origin)],
+)
 async def trigger_model_scan(provider_key: str, model_id: str) -> dict[str, Any]:
     """Trigger health check for a single model. The ID may contain slashes."""
     _require_provider(provider_key)
+    _enforce_probe_limit()
     result = await _service().probe_single_model(model_id, provider_key)
     return {
         "status": result.status,
