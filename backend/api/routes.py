@@ -2,66 +2,89 @@
 
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
+from core.config import get_provider_config
 from core.models import DashboardResponse, ScanTriggerResponse
 from services.sync_service import SyncService
 
 router = APIRouter()
 
-# Populated by app.py on startup
-sync_service: SyncService = None  # type: ignore
+# Wired by app.py during the lifespan startup.
+sync_service: SyncService | None = None
+
+_VERDICT_MESSAGES = {
+    "already_scanning": "A scan is already in progress",
+    "service_not_initialized": "Service is still starting up",
+}
+
+
+def _service() -> SyncService:
+    if sync_service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+    return sync_service
+
+
+def _rejected(verdict: str) -> ScanTriggerResponse:
+    message = _VERDICT_MESSAGES.get(verdict)
+    if message is None:
+        kind, _, detail = verdict.partition(":")
+        if kind == "cooldown":
+            message = f"Scans are rate limited, retry in {detail}"
+        elif kind == "no_probeable_models":
+            message = f"No probe-able models found for {detail}"
+        else:
+            message = verdict
+    return ScanTriggerResponse(status="rejected", message=message)
+
+
+def _require_provider(provider_key: str) -> None:
+    if get_provider_config(provider_key) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown provider: {provider_key}")
 
 
 @router.get("/models", response_model=DashboardResponse)
 async def get_models() -> dict[str, Any]:
     """Get all models with their current health status."""
-    return await sync_service.get_dashboard_data()
+    return await _service().get_dashboard_data()
 
 
-@router.get("/models/{model_id}")
+@router.get("/models/{model_id:path}")
 async def get_model_detail(model_id: str) -> dict[str, Any]:
     """Get detail for a single model by its ID."""
-    data = await sync_service.get_dashboard_data()
+    data = await _service().get_dashboard_data()
     for m in data.get("models", []):
         if m["id"] == model_id:
             return m
-    from fastapi import HTTPException
     raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
 
 
 @router.post("/scan", response_model=ScanTriggerResponse)
-async def trigger_scan() -> dict[str, str]:
+async def trigger_scan() -> ScanTriggerResponse:
     """Trigger a manual health check scan."""
-    if sync_service.is_scanning:
-        return {"status": "already_scanning", "message": "A scan is already in progress"}
-
-    import asyncio
-    asyncio.create_task(sync_service.run_sync())
-    return {"status": "scan_started", "message": "Background scan initiated"}
+    verdict = await _service().start_scan()
+    if verdict is not None:
+        return _rejected(verdict)
+    return ScanTriggerResponse(status="scan_started", message="Background scan initiated")
 
 
-@router.post("/scan/{provider_key}")
-async def trigger_provider_scan(provider_key: str) -> dict[str, Any]:
+@router.post("/scan/{provider_key}", response_model=ScanTriggerResponse)
+async def trigger_provider_scan(provider_key: str) -> ScanTriggerResponse:
     """Trigger health check for all models of a single provider."""
-    if sync_service.is_scanning:
-        return {"status": "already_scanning", "message": "A scan is already in progress"}
-
-    import asyncio
-    # Run in background so we don't block
-    async def _do():
-        result = await sync_service.probe_provider(provider_key)
-        print(f"🔍 Provider scan {provider_key}: {result}")
-        return result
-
-    asyncio.create_task(_do())
-    return {"status": "scan_started", "message": f"Background scan initiated for {provider_key}"}
+    _require_provider(provider_key)
+    verdict = await _service().start_provider_scan(provider_key)
+    if verdict is not None:
+        return _rejected(verdict)
+    return ScanTriggerResponse(
+        status="scan_started", message=f"Background scan initiated for {provider_key}"
+    )
 
 
-@router.post("/scan/{provider_key}/{model_id}")
+@router.post("/scan/{provider_key}/{model_id:path}")
 async def trigger_model_scan(provider_key: str, model_id: str) -> dict[str, Any]:
-    """Trigger health check for a single model."""
-    result = await sync_service.probe_single_model(model_id, provider_key)
+    """Trigger health check for a single model. The ID may contain slashes."""
+    _require_provider(provider_key)
+    result = await _service().probe_single_model(model_id, provider_key)
     return {
         "status": result.status,
         "model_id": result.model_id,
