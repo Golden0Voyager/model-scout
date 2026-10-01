@@ -46,10 +46,13 @@ PROVIDER_KEYS = {p.api_key_env for p in PROVIDERS.values()}
 
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path):
+    """Point the pooled connection at a throwaway file for the duration of one test."""
     original = database.DB_PATH
+    asyncio.run(database.close_db())
     database.DB_PATH = str(tmp_path / "test.db")
     asyncio.run(database.init_db())
     yield database.DB_PATH
+    asyncio.run(database.close_db())
     database.DB_PATH = original
 
 
@@ -334,6 +337,50 @@ def test_log_scan_finish_tolerates_missing_row() -> None:
         await database.init_db()
         await database.log_scan_finish(None, models_checked=0, models_online=0)
         assert await database.get_scan_stats() == {"total_scans": 0, "total_online_ever": 0}
+
+    asyncio.run(scenario())
+
+
+def test_connection_is_pooled_and_runs_in_wal() -> None:
+    async def scenario() -> None:
+        db = await database.get_db()
+        assert await database.get_db() is db
+        async with db.execute("PRAGMA journal_mode") as cursor:
+            mode = await cursor.fetchone()
+        assert mode is not None
+        assert str(mode[0]).lower() == "wal"
+        async with db.execute("PRAGMA busy_timeout") as cursor:
+            timeout = await cursor.fetchone()
+        assert timeout is not None
+        assert timeout[0] == 5000
+
+    asyncio.run(scenario())
+
+
+def test_close_db_forces_a_reconnect() -> None:
+    async def scenario() -> None:
+        before = await database.get_db()
+        await database.close_db()
+        assert await database.get_db() is not before
+        await database.upsert_health({"model_id": "m", "provider": "deepseek", "status": "online"})
+        assert len(await database.get_all_health()) == 1
+
+    asyncio.run(scenario())
+
+
+def test_concurrent_writes_and_reads_do_not_deadlock() -> None:
+    """The regression: a scan persisting hundreds of rows while the dashboard polls."""
+
+    async def scenario() -> None:
+        writes = [
+            database.upsert_health(
+                {"model_id": f"m{i}", "provider": "scnet", "status": "online", "latency_ms": i}
+            )
+            for i in range(120)
+        ]
+        reads = [database.get_all_health(), database.get_scan_stats(), database.get_last_scan_time()]
+        await asyncio.gather(*writes, *reads)
+        assert len(await database.get_all_health()) == 120
 
     asyncio.run(scenario())
 

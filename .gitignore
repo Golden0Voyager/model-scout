@@ -5,6 +5,9 @@ __pycache__/
 .coverage
 node_modules/
 *.db
+# SQLite WAL sidecars
+*.db-wal
+*.db-shm
 .DS_Store
 # git-feature worktrees
 .worktrees/
