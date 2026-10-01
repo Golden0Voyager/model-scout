@@ -247,6 +247,9 @@ class SyncService:
         if checker is None:
             return {"status": "error", "message": "Health checker not initialized"}
 
+        # One snapshot per scan: every model of a provider should see the same
+        # catalogue, fetched once.
+        checker.reset_model_cache()
         scan_id = await log_scan_start()
         start_time = datetime.now(UTC)
 
@@ -331,6 +334,8 @@ class SyncService:
     async def _probe_provider_models(
         self, provider_key: str, models: list[ModelConfig], checker: HealthChecker
     ) -> dict[str, Any]:
+        # A refresh should actually re-read the provider, not serve a stale snapshot.
+        checker.reset_model_cache()
         probes = [{"model_id": m.id, "provider": m.provider} for m in models]
         results = await checker.probe_batch(probes, concurrency=6)
 

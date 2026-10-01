@@ -46,6 +46,11 @@ def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
     return capabilities
 
 
+# (model_ids, latency_ms, error_message) — a failed lookup is a value too, so it can
+# be cached instead of re-fetched once per model.
+ModelsSnapshot = tuple[set | None, int | None, str | None]
+
+
 class HealthChecker:
     def __init__(self, proxy: str | None = None):
         self._proxy = proxy
@@ -59,9 +64,14 @@ class HealthChecker:
             timeout=15.0, follow_redirects=True, trust_env=False
         )
         self._openai_clients: dict[str, AsyncOpenAI] = {}
-        # Cache for provider model lists: provider_key -> (fetch_time_ms, models_set, latency_ms)
-        self._models_cache: dict[str, tuple[int, set, int | None]] = {}
-        self._cache_ttl_ms = 30000  # 30s cache for models endpoint
+        # provider_key -> (fetched_at_ms, snapshot)
+        self._models_cache: dict[str, tuple[int, ModelsSnapshot]] = {}
+        # provider_key -> the fetch every concurrent probe should join
+        self._models_inflight: dict[str, asyncio.Task[ModelsSnapshot]] = {}
+        # Must outlast a full scan (measured ~40s over ~490 models); a shorter TTL
+        # expired mid-scan and made every later model re-fetch. Scans also reset the
+        # cache explicitly, so this bound only governs ad-hoc single-model probes.
+        self._cache_ttl_ms = 120_000
 
     async def __aenter__(self) -> "HealthChecker":
         return self
@@ -109,39 +119,60 @@ class HealthChecker:
         self._openai_clients[provider.key] = client
         return client
 
-    async def _fetch_provider_models(self, provider: ProviderConfig) -> tuple[set | None, int | None, str | None]:
-        """Fetch the provider's model list, with caching.
-        Returns (model_ids_set, latency_ms, error_message)."""
-        now = int(time.time() * 1000)
-        cached = self._models_cache.get(provider.key)
-        if cached:
-            cached_time, cached_set, cached_latency = cached
-            if now - cached_time < self._cache_ttl_ms:
-                return cached_set, cached_latency, None
+    def reset_model_cache(self) -> None:
+        """Drop every cached catalogue so the next scan sees one coherent snapshot."""
+        self._models_cache.clear()
 
+    async def _fetch_provider_models(self, provider: ProviderConfig) -> ModelsSnapshot:
+        """Fetch the provider's model list: cached, and shared by concurrent callers.
+
+        A single scan probes hundreds of models from the same provider, so failures are
+        cached as readily as successes — otherwise a broken /models was re-requested
+        once per model — and concurrent callers join one in-flight request rather than
+        each issuing their own.
+        """
+        cached = self._models_cache.get(provider.key)
+        if cached is not None:
+            fetched_at, snapshot = cached
+            if int(time.time() * 1000) - fetched_at < self._cache_ttl_ms:
+                return snapshot
+
+        inflight = self._models_inflight.get(provider.key)
+        if inflight is not None:
+            return await asyncio.shield(inflight)
+
+        task = asyncio.create_task(self._load_provider_models(provider))
+        self._models_inflight[provider.key] = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            self._models_inflight.pop(provider.key, None)
+
+    async def _load_provider_models(self, provider: ProviderConfig) -> ModelsSnapshot:
         api_key = self._api_key(provider)
         if api_key is None:
-            return None, None, f"no API key ({provider.api_key_env})"
+            snapshot: ModelsSnapshot = (None, None, f"no API key ({provider.api_key_env})")
+        else:
+            client = self._get_http_client(provider)
+            url = f"{provider.base_url}{provider.models_endpoint}"
+            headers = self._get_auth_headers(provider, api_key)
+            start = time.perf_counter()
+            try:
+                response = await client.get(url, headers=headers)
+                latency_ms = int((time.perf_counter() - start) * 1000)
+                if response.status_code == 200:
+                    models = response.json().get("data", [])
+                    model_ids = {
+                        m.get("id") or m.get("name") for m in models if m.get("id") or m.get("name")
+                    }
+                    snapshot = (model_ids, latency_ms, None)
+                else:
+                    snapshot = (None, latency_ms, f"HTTP {response.status_code}")
+            except Exception as e:
+                snapshot = (None, None, str(e)[:120])
 
-        client = self._get_http_client(provider)
-        url = f"{provider.base_url}{provider.models_endpoint}"
-        headers = self._get_auth_headers(provider, api_key)
-
-        start = time.perf_counter()
-        try:
-            response = await client.get(url, headers=headers)
-            latency_ms = int((time.perf_counter() - start) * 1000)
-
-            if response.status_code == 200:
-                data = response.json()
-                models = data.get("data", [])
-                model_ids = {m.get("id") or m.get("name") for m in models if m.get("id") or m.get("name")}
-                self._models_cache[provider.key] = (now, model_ids, latency_ms)
-                return model_ids, latency_ms, None
-
-            return None, latency_ms, f"HTTP {response.status_code}"
-        except Exception as e:
-            return None, None, str(e)[:120]
+        self._models_cache[provider.key] = (int(time.time() * 1000), snapshot)
+        return snapshot
 
     async def probe(self, model_id: str, provider_key: str) -> ProbeResult:
         """Run a lightweight probe for a single model."""
