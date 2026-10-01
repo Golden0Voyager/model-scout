@@ -22,6 +22,13 @@ from fastapi.testclient import TestClient
 import api.routes
 from api.routes import router
 from core import database
+from core.access import (
+    ALLOWED_ORIGINS,
+    PROBE_MAX_CALLS,
+    SlidingWindowLimiter,
+    is_trusted_origin,
+    probe_limiter,
+)
 from core.config import PROVIDERS, STATIC_MODELS, get_provider_config, get_static_models
 from services.health_checker import HealthChecker, ProbeResult
 from services.sync_service import SyncService
@@ -37,6 +44,14 @@ def isolated_db(tmp_path):
     asyncio.run(database.init_db())
     yield database.DB_PATH
     database.DB_PATH = original
+
+
+@pytest.fixture(autouse=True)
+def fresh_probe_budget():
+    """The limiter is process-global, so tests must not inherit each other's budget."""
+    probe_limiter.reset()
+    yield
+    probe_limiter.reset()
 
 
 def _stub_service(urls: list[str] | None = None) -> SyncService:
@@ -434,4 +449,103 @@ def test_scan_omits_models_with_probe_disabled() -> None:
     assert len(anyrouter) == 11
     assert {r["status"] for r in anyrouter} == {"unknown"}
     assert all("Probe disabled" in (r["error_message"] or "") for r in anyrouter)
+
+
+# ---------------------------------------------------------------- access control
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://evil.com",
+        "null",  # sandboxed iframe / file:// document
+        "http://localhost:3000.evil.com",  # prefix spoof
+        "https://localhost:3000",  # wrong scheme
+    ],
+)
+def test_cross_origin_scan_requests_are_rejected(origin: str) -> None:
+    service = _stub_service()
+    response = _client(service).post("/api/scan", headers={"Origin": origin})
+    assert response.status_code == 403
+    # Rejection must happen before the handler, so no paid work is kicked off.
+    assert service.recorded_requests == []  # type: ignore[attr-defined]
+    assert not service.is_scanning
+
+
+@pytest.mark.parametrize("origin", ALLOWED_ORIGINS)
+def test_dashboard_origins_may_trigger_scans(origin: str) -> None:
+    response = _client(_stub_service()).post("/api/scan/deepseek", headers={"Origin": origin})
+    assert response.status_code == 200
+
+
+def test_request_without_origin_is_treated_as_local() -> None:
+    """curl and local scripts send no Origin; they already hold the keys in .env."""
+    assert is_trusted_origin(None)
+    assert _client(_stub_service()).post("/api/scan").status_code == 200
+
+
+def test_reads_are_not_restricted_by_origin() -> None:
+    response = _client(_stub_service()).get("/api/models", headers={"Origin": "http://evil.com"})
+    assert response.status_code == 200
+
+
+def test_cors_and_scan_guard_share_one_allowlist() -> None:
+    """The two lists must not drift, or CORS would admit an origin the guard rejects."""
+    from starlette.middleware.cors import CORSMiddleware
+
+    import app as app_module
+
+    cors = next(m for m in app_module.app.user_middleware if m.cls is CORSMiddleware)
+    configured = cors.kwargs["allow_origins"]
+    assert isinstance(configured, list | tuple), configured
+    assert set(map(str, configured)) == set(ALLOWED_ORIGINS)
+
+
+# ---------------------------------------------------------------- probe rate limit
+
+
+def test_per_model_probes_are_capped() -> None:
+    probed: list[str] = []
+    service = _stub_service()
+
+    async def fake_probe(model_id: str, provider_key: str) -> ProbeResult:
+        probed.append(model_id)
+        return ProbeResult(model_id=model_id, provider=provider_key, status="online")
+
+    service.probe_single_model = fake_probe  # type: ignore[method-assign]
+    client = _client(service)
+
+    codes = [client.post(f"/api/scan/deepseek/m{i}").status_code for i in range(PROBE_MAX_CALLS + 2)]
+    assert codes[:PROBE_MAX_CALLS] == [200] * PROBE_MAX_CALLS
+    assert codes[PROBE_MAX_CALLS:] == [429, 429]
+    # The cap must stop the work, not merely the response.
+    assert len(probed) == PROBE_MAX_CALLS
+
+
+def test_rate_limit_advertises_retry_after() -> None:
+    async def fake_probe(model_id: str, provider_key: str) -> ProbeResult:
+        return ProbeResult(model_id=model_id, provider=provider_key, status="online")
+
+    service = _stub_service()
+    service.probe_single_model = fake_probe  # type: ignore[method-assign]
+    client = _client(service)
+
+    for i in range(PROBE_MAX_CALLS):
+        client.post(f"/api/scan/deepseek/m{i}")
+    response = client.post("/api/scan/deepseek/over-limit")
+    assert response.status_code == 429
+    assert int(response.headers["Retry-After"]) > 0
+
+
+def test_sliding_window_frees_slots_over_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = [1000.0]
+    monkeypatch.setattr("core.access.time.monotonic", lambda: clock[0])
+
+    limiter = SlidingWindowLimiter(2, 10.0)
+    assert limiter.acquire() is None
+    assert limiter.acquire() is None
+    assert limiter.acquire() is not None
+
+    clock[0] += 11.0
+    assert limiter.acquire() is None
 
