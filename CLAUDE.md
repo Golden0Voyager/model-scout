@@ -41,6 +41,7 @@ npm run dev
 - **`services/health_checker.py`**：健康探测引擎。支持 models_endpoint 探测（免费）和 chat_ping（最小 token 成本），带 30s 缓存
 - **`services/sync_service.py`**：同步调度服务。`acquire_scan()` 提供原子扫描槽位，`MIN_SCAN_INTERVAL_SECONDS` 提供冷却，探测为 6 并发 + 150ms 间隔
 - **`core/access.py`**：扫描接口的访问控制。`ALLOWED_ORIGINS` 校验请求来源，`probe_limiter` 为单模型探测提供滑动窗口限流
+- **`services/fx.py`**：`FxRate` 保存 USD/CNY 参考汇率。由后台任务按 `FX_REFRESH_SECONDS` 刷新，取不到时保留上一次好值、最终回退到 `FALLBACK_CNY_PER_USD`
 
 ### 前端（Next.js 16 + React 19 + Tailwind CSS v4）
 
@@ -50,7 +51,7 @@ npm run dev
 - 卡片/列表双视图切换
 - 供应商分组折叠、能力标签筛选、30 秒轮询
 - `components/ModelModal.tsx`：模型详情弹窗
-- `lib/format.ts`：`page.tsx` 与弹窗共用的展示层格式化函数（`formatPrice` / `formatContext` / `latencyColor`）与 `CNY_TO_USD` 汇率常量。汇率是写死的静态值，需要调整只改这一处
+- `lib/format.ts`：`page.tsx` 与弹窗共用的展示层格式化函数（`formatPrice` / `formatContext` / `latencyColor`）。汇率由 `/api/models` 的 `cny_per_usd` 字段下发并逐层传入；导出的 `CNY_TO_USD` 只是后端还没取到汇率时的兜底值
 
 `STATUS_META` 与 `CAPABILITY_LABELS` 目前仍在两个文件里各存一份，尚未收敛。
 
@@ -87,6 +88,7 @@ cd frontend && npm run lint && npx tsc --noEmit
 
 - **代理路由**：`core/config.py` 的 `network` 字段决定走向——`proxy` 走 `MODELSCOUT_PROXY_URL`（海外供应商），`direct` 始终绕过代理（国内供应商）。两个 httpx 客户端都带 `trust_env=False`，防止环境里的 `*_proxy` 把 direct 组也卷进海外出口，不要移除
 - **只读接口不碰外网**：`GET /api/models` 只读 SQLite；模型发现仅由启动扫描、定时任务和显式 `POST /api/scan` 触发
+- **汇率走后台**：`FxRate` 由 lifespan 里的独立后台任务刷新（默认 6 小时），**不在读接口里惰性拉取**——否则会把上面那条不变式重新打开。lifespan 也不 `await` 首次刷新，否则两个源各 10 秒超时会把启动卡住最多 20 秒；这期间 payload 下发兜底值。返回给前端的是 `cny_per_usd`，超出 1–20 合理区间的值一律拒用
 - **扫描接口来源校验**：三个 `POST /api/scan*` 走 `require_trusted_origin`。浏览器对跨源 POST 一定附带 `Origin`，因此不在白名单（含 `Origin: null`）即 403，无需向前端分发密钥。Next 的 rewrites 是服务端代理且会透传 `Origin`，所以前端链路同样受保护、也照常放行（已实测）。**不带 `Origin` 视为本地请求**：curl 和本地脚本本来就能读到 `.env` 里的全部密钥，给它们加令牌保护不了任何东西。若将来把服务绑到非回环地址，这套就不够了，需要真正的鉴权
 - **面板换端口时**：`ALLOWED_ORIGINS` 与 CORS 共用同一份常量，改端口要同时更新 `core/access.py` 和 `next.config.ts`
 - **单模型探测限流**：`POST /api/scan/{provider}/{model}` 每次都是一笔真实请求且不受扫描冷却约束，故独立限流为 30 次/60 秒，超限返回 429 并带 `Retry-After`

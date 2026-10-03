@@ -1,10 +1,10 @@
 // Presentation helpers shared by the dashboard and the model modal.
 // Both files previously carried their own copy, which is how the CNY/USD rate ended
-// up written down twice; keep conversions here so there is one place to update.
+// up written down twice; keep conversions here so there is one place to look.
 
-// Static, not fetched: this only powers a rough price comparison in the UI.
-// 7.2 was stale by ~7% against the 2026-10-03 market (er-api 6.7144, ECB 6.7046),
-// which understated every USD equivalent of a CNY-priced model.
+// Fallback only: the live rate arrives on the dashboard payload as `cny_per_usd`,
+// refreshed server-side. 7.2 was stale by ~7% against the 2026-10-03 market
+// (er-api 6.7144, ECB 6.7046), understating every USD equivalent of a CNY price.
 export const CNY_TO_USD = 6.71;
 
 export function latencyColor(ms: number): string {
@@ -23,16 +23,21 @@ export function formatContext(n: number): string {
 /**
  * Returns null when the price is unknown, so each surface can pick its own wording —
  * the modal sits under a "Pricing" heading and reads better as a bare "N/A".
+ *
+ * `cnyPerUsd` comes from the dashboard payload (refreshed server-side); the exported
+ * constant is only the fallback for when that fetch has not succeeded yet.
  */
 export function formatPrice(
   input?: number,
   output?: number,
-  currency?: string
+  currency?: string,
+  cnyPerUsd: number = CNY_TO_USD
 ): string | null {
   if (input == null || output == null) return null;
   if (currency === "CNY" || !currency) {
-    const inUsd = input / CNY_TO_USD;
-    const outUsd = output / CNY_TO_USD;
+    const rate = cnyPerUsd > 0 ? cnyPerUsd : CNY_TO_USD;
+    const inUsd = input / rate;
+    const outUsd = output / rate;
     return `$${inUsd.toFixed(2)} / $${outUsd.toFixed(2)} per 1M tokens (¥${input.toFixed(2)} / ¥${output.toFixed(2)})`;
   }
   return `$${input.toFixed(2)} / $${output.toFixed(2)} per 1M tokens`;
