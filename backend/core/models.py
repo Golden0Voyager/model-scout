@@ -2,6 +2,8 @@
 
 from pydantic import BaseModel, Field
 
+from core.config import FALLBACK_CNY_PER_USD
+
 
 class ModelInfo(BaseModel):
     id: str
@@ -50,6 +52,7 @@ class DashboardResponse(BaseModel):
     avg_latency_ms: int | None = None
     last_scan_time: str | None = None
     is_scanning: bool = False
+    cny_per_usd: float = FALLBACK_CNY_PER_USD
 
 
 class ScanTriggerResponse(BaseModel):

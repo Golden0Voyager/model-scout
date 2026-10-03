@@ -5,14 +5,16 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.access import PROBE_MAX_CALLS, PROBE_WINDOW_SECONDS, probe_limiter, require_trusted_origin
-from core.config import get_provider_config, provider_enabled
+from core.config import FALLBACK_CNY_PER_USD, get_provider_config, provider_enabled
 from core.models import DashboardResponse, ScanTriggerResponse
+from services.fx import FxRate
 from services.sync_service import SyncService
 
 router = APIRouter()
 
 # Wired by app.py during the lifespan startup.
 sync_service: SyncService | None = None
+fx_rate: FxRate | None = None
 
 _VERDICT_MESSAGES = {
     "already_scanning": "A scan is already in progress",
@@ -63,7 +65,10 @@ def _enforce_probe_limit() -> None:
 @router.get("/models", response_model=DashboardResponse)
 async def get_models() -> dict[str, Any]:
     """Get all models with their current health status."""
-    return await _service().get_dashboard_data()
+    data = await _service().get_dashboard_data()
+    # Cached server-side; the read path itself never reaches out for it.
+    data["cny_per_usd"] = fx_rate.cny_per_usd if fx_rate is not None else FALLBACK_CNY_PER_USD
+    return data
 
 
 @router.get("/models/{model_id:path}")

@@ -85,6 +85,7 @@ interface DashboardData {
   avg_latency_ms?: number;
   last_scan_time?: string;
   is_scanning: boolean;
+  cny_per_usd?: number;
 }
 
 type SortKey = "default" | "name" | "latency" | "price" | "context" | "status";
@@ -703,6 +704,7 @@ export default function Home() {
                           isScanning={scanningModels.has(`${m.provider}:${m.id}`)}
                           onRefresh={() => triggerModelScan(m.provider, m.id)}
                           onSelect={() => setSelectedModel(m)}
+                          cnyPerUsd={data?.cny_per_usd}
                         />
                       ))}
                     </div>
@@ -743,6 +745,7 @@ export default function Home() {
                           isScanning={scanningModels.has(`${m.provider}:${m.id}`)}
                           onRefresh={() => triggerModelScan(m.provider, m.id)}
                           onSelect={() => setSelectedModel(m)}
+                          cnyPerUsd={data?.cny_per_usd}
                         />
                       ))}
                     </div>
@@ -776,6 +779,7 @@ export default function Home() {
             ? scanningModels.has(`${selectedModel.provider}:${selectedModel.id}`)
             : false
         }
+        cnyPerUsd={data?.cny_per_usd}
       />
     </main>
   );
@@ -861,7 +865,7 @@ function ProviderGroup({
   );
 }
 
-function ModelCard({ model, isScanning, onRefresh, onSelect }: { model: Model; isScanning?: boolean; onRefresh?: () => void; onSelect?: () => void }) {
+function ModelCard({ model, isScanning, onRefresh, onSelect, cnyPerUsd }: { model: Model; isScanning?: boolean; onRefresh?: () => void; onSelect?: () => void; cnyPerUsd?: number }) {
   const h = model.health;
   const meta = STATUS_META[h.status] || STATUS_META.unknown;
   const [copied, setCopied] = useState(false);
@@ -976,7 +980,7 @@ function ModelCard({ model, isScanning, onRefresh, onSelect }: { model: Model; i
           </span>
         ) : (
           <span className="text-[11px] text-slate-400">
-            {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency) ?? "Pricing N/A"}
+            {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency, cnyPerUsd) ?? "Pricing N/A"}
             {model.pricing_note && <span className="text-slate-600 ml-1">· {model.pricing_note}</span>}
           </span>
         )}
@@ -995,7 +999,7 @@ function ModelCard({ model, isScanning, onRefresh, onSelect }: { model: Model; i
   );
 }
 
-function ModelListRow({ model, isScanning, onRefresh, onSelect }: { model: Model; isScanning?: boolean; onRefresh?: () => void; onSelect?: () => void }) {
+function ModelListRow({ model, isScanning, onRefresh, onSelect, cnyPerUsd }: { model: Model; isScanning?: boolean; onRefresh?: () => void; onSelect?: () => void; cnyPerUsd?: number }) {
   const h = model.health;
   const meta = STATUS_META[h.status] || STATUS_META.unknown;
   const [copied, setCopied] = useState(false);
@@ -1069,7 +1073,7 @@ function ModelListRow({ model, isScanning, onRefresh, onSelect }: { model: Model
           <span className="text-emerald-400 font-medium">Free</span>
         ) : (
           <span className="text-slate-400">
-            {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency) ?? "Pricing N/A"}
+            {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency, cnyPerUsd) ?? "Pricing N/A"}
           </span>
         )}
       </div>

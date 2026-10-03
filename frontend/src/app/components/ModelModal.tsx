@@ -83,9 +83,10 @@ interface ModelModalProps {
   onClose: () => void;
   onRefresh?: () => void;
   isScanning?: boolean;
+  cnyPerUsd?: number;
 }
 
-export default function ModelModal({ model, onClose, onRefresh, isScanning }: ModelModalProps) {
+export default function ModelModal({ model, onClose, onRefresh, isScanning, cnyPerUsd }: ModelModalProps) {
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -225,7 +226,7 @@ export default function ModelModal({ model, onClose, onRefresh, isScanning }: Mo
               <div className="text-sm font-medium text-emerald-400">Free (rate limited)</div>
             ) : (
               <div className="text-sm text-slate-300">
-                {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency) ?? "N/A"}
+                {formatPrice(model.pricing_input_per_1m, model.pricing_output_per_1m, model.pricing_currency, cnyPerUsd) ?? "N/A"}
               </div>
             )}
             {model.pricing_note && (
