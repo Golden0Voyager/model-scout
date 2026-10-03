@@ -3,7 +3,9 @@
 // up written down twice; keep conversions here so there is one place to update.
 
 // Static, not fetched: this only powers a rough price comparison in the UI.
-export const CNY_TO_USD = 7.2;
+// 7.2 was stale by ~7% against the 2026-10-03 market (er-api 6.7144, ECB 6.7046),
+// which understated every USD equivalent of a CNY-priced model.
+export const CNY_TO_USD = 6.71;
 
 export function latencyColor(ms: number): string {
   if (ms < 200) return "#22c55e"; // emerald-500 - excellent
