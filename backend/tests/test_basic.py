@@ -913,8 +913,15 @@ def test_fx_falls_through_to_the_second_source() -> None:
 
 def test_fx_keeps_the_last_good_rate_when_every_source_fails() -> None:
     fx = _fx_with([ER_API_HIT, (500, {}), (500, {})])
-    asyncio.run(fx.refresh())
-    outcome = _refresh(fx)
+
+    async def scenario() -> dict[str, Any]:
+        await fx.refresh()
+        try:
+            return await fx.refresh()
+        finally:
+            await fx.aclose()
+
+    outcome = asyncio.run(scenario())
     assert outcome["status"] == "fallback"
     # The previous good rate, not the bundled constant.
     assert fx.cny_per_usd == 6.714383
@@ -952,12 +959,17 @@ def test_fx_sources_are_two_independent_hosts() -> None:
 
 def test_dashboard_payload_carries_the_live_rate() -> None:
     fx = _fx_with([ER_API_HIT])
-    asyncio.run(fx.refresh())
+
+    async def prime() -> None:
+        await fx.refresh()
+        await fx.aclose()
+
+    asyncio.run(prime())
+    # The route only reads the cached attribute; the client is never driven from a
+    # second event loop, which is what deadlocks httpx on Linux.
     api.routes.fx_rate = fx
-    client = _client(_stub_service())
-    payload = client.get("/api/models").json()
+    payload = _client(_stub_service()).get("/api/models").json()
     assert payload["cny_per_usd"] == 6.714383
-    asyncio.run(fx.aclose())
 
 
 def test_dashboard_payload_falls_back_without_a_wired_rate() -> None:
@@ -968,7 +980,13 @@ def test_dashboard_payload_falls_back_without_a_wired_rate() -> None:
 def test_read_path_still_makes_no_outbound_request_with_fx() -> None:
     """The FX design must not re-open the hole that GET /api/models used to have."""
     urls: list[str] = []
-    api.routes.fx_rate = _fx_with([ER_API_HIT])
-    client = _client(_stub_service(urls))
-    assert client.get("/api/models").status_code == 200
+    fx = _fx_with([ER_API_HIT])
+
+    async def prime() -> None:
+        await fx.refresh()
+        await fx.aclose()
+
+    asyncio.run(prime())
+    api.routes.fx_rate = fx
+    assert _client(_stub_service(urls)).get("/api/models").status_code == 200
     assert urls == []
