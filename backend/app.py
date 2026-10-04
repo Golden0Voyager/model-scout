@@ -21,7 +21,6 @@ import api.routes
 from api.routes import router
 from core.access import ALLOWED_ORIGINS
 from core.config import PROVIDERS
-from core.database import close_db
 from services.fx import FxRate
 from services.sync_service import SyncService
 
@@ -151,7 +150,6 @@ async def lifespan(app: FastAPI):
 
     await fx.aclose()
     await service.shutdown()
-    await close_db()
     print("👋 ModelScout shutdown complete")
 
 
