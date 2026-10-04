@@ -22,6 +22,7 @@ from api.routes import router
 from core.access import ALLOWED_ORIGINS
 from core.config import PROVIDERS
 from core.database import close_db
+from services.fx import FxRate
 from services.sync_service import SyncService
 
 load_dotenv()
@@ -63,9 +64,31 @@ if _missing_keys:
 DEBUG = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "5"))
 
+# The rate is a daily-order figure used only for a rough price comparison.
+FX_REFRESH_SECONDS = 6 * 60 * 60
+
 # Global state
 _start_time = time.time()
 _scan_task: asyncio.Task | None = None
+_fx_task: asyncio.Task | None = None
+
+
+async def _fx_refresh_loop(fx: FxRate) -> None:
+    # Refreshes immediately, then on an interval. Never awaited by the lifespan: two
+    # unreachable sources at 10s each would otherwise stall startup behind the fallback.
+    while True:
+        try:
+            outcome = await fx.refresh()
+            if outcome["status"] == "updated":
+                print(f"[fx] USD/CNY = {fx.cny_per_usd} via {fx.source}")
+            else:
+                print(f"[fx] keeping {fx.cny_per_usd}: {', '.join(outcome.get('failures', []))}")
+            await asyncio.sleep(FX_REFRESH_SECONDS)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[fx] refresh error: {e}")
+            await asyncio.sleep(60)
 
 
 async def _scheduled_scan_loop(service: SyncService):
@@ -84,7 +107,7 @@ async def _scheduled_scan_loop(service: SyncService):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _scan_task
+    global _scan_task, _fx_task
 
     proxy_url = _resolve_proxy_url()
     proxied = [p.name for p in PROVIDERS.values() if p.network == "proxy"]
@@ -96,8 +119,11 @@ async def lifespan(app: FastAPI):
     service = SyncService(proxy=proxy_url)
     await service.initialize()
 
+    fx = FxRate(proxy=proxy_url)
+
     # Wire routes
     api.routes.sync_service = service
+    api.routes.fx_rate = fx
 
     # Initial scan on startup
     verdict = await service.start_scan()
@@ -106,19 +132,24 @@ async def lifespan(app: FastAPI):
 
     # Start scheduler
     _scan_task = asyncio.create_task(_scheduled_scan_loop(service))
+    _fx_task = asyncio.create_task(_fx_refresh_loop(fx))
 
     print(f"🚀 ModelScout v2.0 started (scan interval: {SCAN_INTERVAL_MINUTES}min)")
 
     yield
 
     # Shutdown
-    if _scan_task:
-        _scan_task.cancel()
-        try:
-            await _scan_task
-        except asyncio.CancelledError:
-            pass
+    for task in (_scan_task, _fx_task):
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    _scan_task = None
+    _fx_task = None
 
+    await fx.aclose()
     await service.shutdown()
     await close_db()
     print("👋 ModelScout shutdown complete")

@@ -6,6 +6,14 @@ All models from the user's documented providers are listed here.
 
 from dataclasses import dataclass, field
 
+# Used whenever the live USD/CNY rate is unavailable, so a price comparison degrades to
+# a slightly stale number rather than to nothing. Mirrors CNY_TO_USD in the frontend.
+FALLBACK_CNY_PER_USD = 6.71
+
+# Accepted band for a fetched USD/CNY rate. A malformed or unrelated payload must not
+# silently bias every converted price, so anything outside this is rejected.
+CNY_PER_USD_BOUNDS = (1.0, 20.0)
+
 
 @dataclass
 class ModelConfig:

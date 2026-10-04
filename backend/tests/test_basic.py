@@ -13,6 +13,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import pytest
@@ -30,6 +31,7 @@ from core.access import (
     probe_limiter,
 )
 from core.config import (
+    FALLBACK_CNY_PER_USD,
     PROVIDERS,
     STATIC_MODELS,
     get_models_for_provider,
@@ -37,6 +39,7 @@ from core.config import (
     get_static_models,
     provider_enabled,
 )
+from services.fx import SOURCES, FxRate
 from services.health_checker import HealthChecker, ProbeResult
 from services.sync_service import SyncService
 
@@ -62,6 +65,13 @@ def fresh_probe_budget():
     probe_limiter.reset()
     yield
     probe_limiter.reset()
+
+
+@pytest.fixture(autouse=True)
+def unwired_fx():
+    api.routes.fx_rate = None
+    yield
+    api.routes.fx_rate = None
 
 
 def _stub_service(urls: list[str] | None = None) -> SyncService:
@@ -855,3 +865,128 @@ def test_sliding_window_frees_slots_over_time(monkeypatch: pytest.MonkeyPatch) -
     clock[0] += 11.0
     assert limiter.acquire() is None
 
+
+
+# ---------------------------------------------------------------- fx rate
+
+ER_API_HIT = (200, {"rates": {"CNY": 6.714383}})
+FRANKFURT_HIT = (200, {"rates": {"CNY": 6.7046}, "date": "2026-10-02"})
+
+
+def _fx_with(responses: list[tuple[int, dict[str, Any]]]) -> FxRate:
+    """Queue canned responses for the sources in their declared order."""
+    remaining = list(responses)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        status, body = remaining.pop(0)
+        return httpx.Response(status, json=body)
+
+    return FxRate(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+def _refresh(fx: FxRate) -> dict[str, Any]:
+    async def scenario() -> dict[str, Any]:
+        try:
+            return await fx.refresh()
+        finally:
+            await fx.aclose()
+
+    return asyncio.run(scenario())
+
+
+def test_fx_reads_the_first_source() -> None:
+    fx = _fx_with([ER_API_HIT])
+    outcome = _refresh(fx)
+    assert outcome["status"] == "updated"
+    assert fx.cny_per_usd == 6.714383
+    assert fx.source == "open.er-api.com"
+    assert fx.fetched_at
+
+
+def test_fx_falls_through_to_the_second_source() -> None:
+    fx = _fx_with([(429, {}), FRANKFURT_HIT])
+    outcome = _refresh(fx)
+    assert outcome["status"] == "updated"
+    assert fx.cny_per_usd == 6.7046
+    assert fx.source == "api.frankfurter.dev"
+
+
+def test_fx_keeps_the_last_good_rate_when_every_source_fails() -> None:
+    fx = _fx_with([ER_API_HIT, (500, {}), (500, {})])
+
+    async def scenario() -> dict[str, Any]:
+        await fx.refresh()
+        try:
+            return await fx.refresh()
+        finally:
+            await fx.aclose()
+
+    outcome = asyncio.run(scenario())
+    assert outcome["status"] == "fallback"
+    # The previous good rate, not the bundled constant.
+    assert fx.cny_per_usd == 6.714383
+    assert len(outcome["failures"]) == 2
+
+
+def test_fx_starts_at_the_fallback_when_nothing_works() -> None:
+    fx = _fx_with([(500, {}), (503, {})])
+    outcome = _refresh(fx)
+    assert outcome["status"] == "fallback"
+    assert fx.cny_per_usd == FALLBACK_CNY_PER_USD
+    assert fx.source is None
+
+
+@pytest.mark.parametrize("bad", [0.0, 999.0, -6.7])
+def test_fx_rejects_out_of_range_rates(bad: float) -> None:
+    """A malformed or unrelated payload must not silently bias every converted price."""
+    fx = _fx_with([(200, {"rates": {"CNY": bad}}), (500, {})])
+    outcome = _refresh(fx)
+    assert outcome["status"] == "fallback"
+    assert fx.cny_per_usd == FALLBACK_CNY_PER_USD
+
+
+def test_fx_survives_malformed_payloads() -> None:
+    fx = _fx_with([(200, {"nope": 1}), (200, {"rates": {"CNY": "abc"}})])
+    outcome = _refresh(fx)
+    assert outcome["status"] == "fallback"
+    assert fx.cny_per_usd == FALLBACK_CNY_PER_USD
+
+
+def test_fx_sources_are_two_independent_hosts() -> None:
+    assert len(SOURCES) >= 2
+    assert len({urlparse(u).netloc for u in SOURCES}) == len(SOURCES)
+
+
+def test_dashboard_payload_carries_the_live_rate() -> None:
+    fx = _fx_with([ER_API_HIT])
+
+    async def prime() -> None:
+        await fx.refresh()
+        await fx.aclose()
+
+    asyncio.run(prime())
+    # The route only reads the cached attribute; the client is never driven from a
+    # second event loop, which is what deadlocks httpx on Linux.
+    api.routes.fx_rate = fx
+    payload = _client(_stub_service()).get("/api/models").json()
+    assert payload["cny_per_usd"] == 6.714383
+
+
+def test_dashboard_payload_falls_back_without_a_wired_rate() -> None:
+    payload = _client(_stub_service()).get("/api/models").json()
+    assert payload["cny_per_usd"] == FALLBACK_CNY_PER_USD
+
+
+def test_read_path_still_makes_no_outbound_request_with_fx() -> None:
+    """The FX design must not re-open the hole that GET /api/models used to have."""
+    urls: list[str] = []
+    fx = _fx_with([ER_API_HIT])
+
+    async def prime() -> None:
+        await fx.refresh()
+        await fx.aclose()
+
+    asyncio.run(prime())
+    api.routes.fx_rate = fx
+    assert _client(_stub_service(urls)).get("/api/models").status_code == 200
+    assert urls == []
