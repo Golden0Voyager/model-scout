@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import httpx
 import pytest
 from fastapi import FastAPI
-from fastapi.testclient import TestClient
+from httpx import ASGITransport
 
 import api.routes
 from api.routes import router
@@ -43,19 +43,40 @@ from services.fx import SOURCES, FxRate
 from services.health_checker import HealthChecker, ProbeResult
 from services.sync_service import SyncService
 
+_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def run(coro: Any) -> Any:
+    """Drive every coroutine in this suite on one shared event loop.
+
+    Each test used to call run() separately, which means the pooled aiosqlite
+    connection was opened in one loop and closed in another; aiosqlite resolves its
+    futures on the loop captured at construction, so the close never returned and
+    pytest hung in fixture teardown on Linux. One loop for the suite removes the class.
+    """
+    global _LOOP
+    if _LOOP is None or _LOOP.is_closed():
+        _LOOP = asyncio.new_event_loop()
+        asyncio.set_event_loop(_LOOP)
+    return _LOOP.run_until_complete(coro)
+
+
 ENV_EXAMPLE = Path(__file__).resolve().parents[1] / ".env.example"
 PROVIDER_KEYS = {p.api_key_env for p in PROVIDERS.values()}
 
 
 @pytest.fixture(autouse=True)
 def isolated_db(tmp_path):
-    """Point the pooled connection at a throwaway file for the duration of one test."""
+    """Point DB_PATH at a throwaway file for the duration of one test.
+
+    Nothing to release: each operation opens and closes its own connection, so
+    repointing the module attribute is sufficient and cannot strand a handle on a
+    dead event loop.
+    """
     original = database.DB_PATH
-    asyncio.run(database.close_db())
     database.DB_PATH = str(tmp_path / "test.db")
-    asyncio.run(database.init_db())
+    run(database.init_db())
     yield database.DB_PATH
-    asyncio.run(database.close_db())
     database.DB_PATH = original
 
 
@@ -92,11 +113,37 @@ def _stub_service(urls: list[str] | None = None) -> SyncService:
     return service
 
 
-def _client(service: SyncService | None) -> TestClient:
-    app = FastAPI()
-    app.include_router(router, prefix="/api")
-    api.routes.sync_service = service
-    return TestClient(app)
+class Api:
+    """The router under test, driven on the suite's own event loop.
+
+    Starlette's TestClient runs the app on a separate anyio portal loop, which means
+    the pooled SQLite connection is created there and can never be closed from this
+    loop — its worker thread then reports results onto a dead loop. ASGITransport
+    keeps every coroutine, and therefore every connection, on one loop.
+    """
+
+    def __init__(self, service: SyncService | None) -> None:
+        app = FastAPI()
+        app.include_router(router, prefix="/api")
+        api.routes.sync_service = service
+        self._transport = ASGITransport(app=app)
+
+    def _call(self, method: str, path: str, headers: dict[str, str] | None):
+        async def request() -> httpx.Response:
+            async with httpx.AsyncClient(transport=self._transport, base_url="http://dashboard") as client:
+                return await client.request(method, path, headers=headers or {})
+
+        return run(request())
+
+    def get(self, path: str, headers: dict[str, str] | None = None) -> httpx.Response:
+        return self._call("GET", path, headers)
+
+    def post(self, path: str, headers: dict[str, str] | None = None) -> httpx.Response:
+        return self._call("POST", path, headers)
+
+
+def _client(service: SyncService | None) -> Api:
+    return Api(service)
 
 
 def _service_with_payload(
@@ -185,7 +232,7 @@ def test_rich_discovery_drives_metadata_not_provider_names() -> None:
 
 def test_rich_catalog_populates_every_advertised_field(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
-    asyncio.run(service._refresh_discovered_models())
+    run(service._refresh_discovered_models())
 
     by_id = {m.id: m for m in service._discovered_models if m.provider == "sensenova"}
     lite = by_id["sensenova-6.8-flash-lite"]
@@ -207,7 +254,7 @@ def test_rich_catalog_populates_every_advertised_field(monkeypatch: pytest.Monke
 def test_unknown_features_do_not_leak_raw_tags(monkeypatch: pytest.MonkeyPatch) -> None:
     """json_mode has no dashboard label, so it must not surface as a raw snake_case tag."""
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
-    asyncio.run(service._refresh_discovered_models())
+    run(service._refresh_discovered_models())
     caps = {c for m in service._discovered_models for c in m.capabilities}
     assert "json_mode" not in caps
     assert not any("_" in c and c not in {"function_calling", "long_context"} for c in caps)
@@ -215,7 +262,7 @@ def test_unknown_features_do_not_leak_raw_tags(monkeypatch: pytest.MonkeyPatch) 
 
 def test_moonshot_still_discovers_through_the_generalised_path(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
-    asyncio.run(service._refresh_discovered_models())
+    run(service._refresh_discovered_models())
     moonshot = [m for m in service._discovered_models if m.provider == "moonshot"]
     assert {m.id for m in moonshot} == {"sensenova-6.8-flash-lite", "deepseek-v4-pro"}
 
@@ -243,7 +290,7 @@ def test_provider_switch_replaced_the_per_model_flags() -> None:
 
 def test_discovery_never_contacts_a_disabled_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
-    asyncio.run(service._refresh_discovered_models())
+    run(service._refresh_discovered_models())
 
     contacted = {u for u in service.recorded_requests if any(h in u for h in DISABLED_HOSTS)}  # type: ignore[attr-defined]
     assert contacted == set()
@@ -262,12 +309,12 @@ def test_scan_skips_every_model_of_a_disabled_provider() -> None:
         return []
 
     service._checker.probe_batch = fake_batch  # type: ignore[method-assign]
-    asyncio.run(service.run_sync())
+    run(service.run_sync())
 
     assert requested
     assert [p for p in requested if p["provider"] in DISABLED] == []
 
-    rows = asyncio.run(database.get_all_health())
+    rows = run(database.get_all_health())
     for key, count in DISABLED_MODEL_COUNTS.items():
         own = [r for r in rows if r["provider"] == key]
         assert len(own) == count, key
@@ -323,7 +370,7 @@ def test_a_scan_fetches_a_provider_catalogue_once(monkeypatch: pytest.MonkeyPatc
     checker, urls = _counting_checker(monkeypatch, payload=catalogue)
     probes = [{"model_id": f"m{i}", "provider": "openrouter"} for i in range(40)]
 
-    results = asyncio.run(checker.probe_batch(probes, concurrency=6))
+    results = run(checker.probe_batch(probes, concurrency=6))
 
     assert [u for u in urls if u.endswith("/models")] == [urls[0]]
     assert all(r.status == "online" for r in results)
@@ -336,7 +383,7 @@ def test_concurrent_lookups_join_one_inflight_request(monkeypatch: pytest.Monkey
     async def scenario() -> list[Any]:
         return list(await asyncio.gather(*(checker._fetch_provider_models(provider) for _ in range(20))))
 
-    snapshots = asyncio.run(scenario())
+    snapshots = run(scenario())
     assert len(urls) == 1
     assert all(snap[0] == {"m0"} for snap in snapshots)
 
@@ -349,7 +396,7 @@ def test_a_failed_lookup_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> list[Any]:
         return [await checker._fetch_provider_models(provider) for _ in range(10)]
 
-    snapshots = asyncio.run(scenario())
+    snapshots = run(scenario())
     assert len(urls) == 1
     assert all(snap[2] == "HTTP 500" for snap in snapshots)
 
@@ -364,7 +411,7 @@ def test_reset_model_cache_forces_a_refetch(monkeypatch: pytest.MonkeyPatch) -> 
         checker.reset_model_cache()
         await checker._fetch_provider_models(provider)
 
-    asyncio.run(scenario())
+    run(scenario())
     assert len(urls) == 2
 
 
@@ -409,7 +456,7 @@ def test_health_upsert_and_read_back() -> None:
         assert [(r["status"], r["latency_ms"]) for r in rows] == [("online", 42)]
         assert rows[0]["last_checked"]
 
-    asyncio.run(scenario())
+    run(scenario())
 
 
 def test_scan_log_lifecycle() -> None:
@@ -421,7 +468,7 @@ def test_scan_log_lifecycle() -> None:
         assert await database.get_last_scan_time() is not None
         assert await database.get_scan_stats() == {"total_scans": 1, "total_online_ever": 2}
 
-    asyncio.run(scenario())
+    run(scenario())
 
 
 def test_log_scan_finish_tolerates_missing_row() -> None:
@@ -432,38 +479,28 @@ def test_log_scan_finish_tolerates_missing_row() -> None:
         await database.log_scan_finish(None, models_checked=0, models_online=0)
         assert await database.get_scan_stats() == {"total_scans": 0, "total_online_ever": 0}
 
-    asyncio.run(scenario())
+    run(scenario())
 
 
-def test_connection_is_pooled_and_runs_in_wal() -> None:
+def test_wal_and_busy_timeout_are_in_effect() -> None:
     async def scenario() -> None:
-        db = await database.get_db()
-        assert await database.get_db() is db
-        async with db.execute("PRAGMA journal_mode") as cursor:
-            mode = await cursor.fetchone()
-        assert mode is not None
-        assert str(mode[0]).lower() == "wal"
-        async with db.execute("PRAGMA busy_timeout") as cursor:
-            timeout = await cursor.fetchone()
-        assert timeout is not None
-        assert timeout[0] == 5000
+        async with database.connect() as db:
+            async with db.execute("PRAGMA journal_mode") as cursor:
+                mode = await cursor.fetchone()
+            async with db.execute("PRAGMA busy_timeout") as cursor:
+                timeout = await cursor.fetchone()
+        assert mode is not None and str(mode[0]).lower() == "wal"
+        assert timeout is not None and timeout[0] == 5000
 
-    asyncio.run(scenario())
-
-
-def test_close_db_forces_a_reconnect() -> None:
-    async def scenario() -> None:
-        before = await database.get_db()
-        await database.close_db()
-        assert await database.get_db() is not before
-        await database.upsert_health({"model_id": "m", "provider": "deepseek", "status": "online"})
-        assert len(await database.get_all_health()) == 1
-
-    asyncio.run(scenario())
+    run(scenario())
 
 
 def test_concurrent_writes_and_reads_do_not_deadlock() -> None:
-    """The regression: a scan persisting hundreds of rows while the dashboard polls."""
+    """The regression: a scan persisting hundreds of rows while the dashboard polls.
+
+    Each call takes its own connection, so this genuinely exercises two or more
+    connections against one WAL file rather than serialising onto one handle.
+    """
 
     async def scenario() -> None:
         writes = [
@@ -476,7 +513,7 @@ def test_concurrent_writes_and_reads_do_not_deadlock() -> None:
         await asyncio.gather(*writes, *reads)
         assert len(await database.get_all_health()) == 120
 
-    asyncio.run(scenario())
+    run(scenario())
 
 
 # ---------------------------------------------------------------- read path
@@ -492,18 +529,20 @@ def test_dashboard_triggers_no_outbound_requests() -> None:
 
 
 def test_dashboard_reports_persisted_health_without_probing() -> None:
-    async def scenario() -> None:
-        await database.init_db()
-        target = STATIC_MODELS[0]
+    target = STATIC_MODELS[0]
+
+    async def seed() -> None:
         await database.upsert_health(
             {"model_id": target.id, "provider": target.provider, "status": "online", "latency_ms": 12}
         )
-        payload = _client(_stub_service()).get("/api/models").json()
-        match = next(m for m in payload["models"] if m["id"] == target.id)
-        assert match["health"]["status"] == "online"
-        assert match["health"]["latency_ms"] == 12
 
-    asyncio.run(scenario())
+    run(seed())
+    # The client drives its own turn on the shared loop, so it is not called from
+    # inside a running coroutine.
+    payload = _client(_stub_service()).get("/api/models").json()
+    match = next(m for m in payload["models"] if m["id"] == target.id)
+    assert match["health"]["status"] == "online"
+    assert match["health"]["latency_ms"] == 12
 
 
 def test_model_detail_lookup_and_missing() -> None:
@@ -560,7 +599,7 @@ def test_scan_slot_is_exclusive_then_rate_limited() -> None:
         service._last_scan_started = time.monotonic() - 3600
         assert await service.acquire_scan() is None
 
-    asyncio.run(scenario())
+    run(scenario())
 
 
 def test_concurrent_scan_triggers_yield_exactly_one_claim() -> None:
@@ -570,17 +609,14 @@ def test_concurrent_scan_triggers_yield_exactly_one_claim() -> None:
         verdicts = await asyncio.gather(*(service.start_scan() for _ in range(10)))
         assert sum(v is None for v in verdicts) == 1  # type: ignore[arg-type]
 
-    asyncio.run(scenario())
+    run(scenario())
 
 
 def test_rejected_scan_reports_reason_to_caller() -> None:
-    async def scenario() -> None:
-        service = SyncService()
-        await service.acquire_scan()
-        payload = _client(service).post("/api/scan").json()
-        assert payload == {"status": "rejected", "message": "A scan is already in progress"}
-
-    asyncio.run(scenario())
+    service = SyncService()
+    run(service.acquire_scan())
+    payload = _client(service).post("/api/scan").json()
+    assert payload == {"status": "rejected", "message": "A scan is already in progress"}
 
 
 # ---------------------------------------------------------------- startup log
@@ -604,7 +640,13 @@ def test_startup_report_never_prints_key_material(
 def test_health_endpoint_shape() -> None:
     import app as app_module
 
-    payload: dict[str, Any] = TestClient(app_module.app).get("/health").json()
+    async def fetch() -> dict[str, Any]:
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app_module.app), base_url="http://dashboard"
+        ) as client:
+            return (await client.get("/health")).json()
+
+    payload = run(fetch())
     assert payload["status"] == "healthy"
     assert payload["uptime_seconds"] >= 0
 
@@ -674,7 +716,7 @@ def _get(url: str, client: httpx.AsyncClient) -> int:
         response = await client.get(url, timeout=5.0)
         return response.status_code
 
-    return asyncio.run(scenario())
+    return run(scenario())
 
 
 def test_direct_pool_ignores_ambient_proxy(
@@ -745,7 +787,7 @@ def test_discovery_without_key_sends_no_request(
     service = _stub_service(urls)
     assert service._checker is not None
 
-    ids, error = asyncio.run(service._checker.discover_models("openrouter"))
+    ids, error = run(service._checker.discover_models("openrouter"))
     assert ids is None
     assert "no API key" in error  # type: ignore[operator]
     assert urls == []
@@ -757,7 +799,7 @@ def test_probe_reports_no_key_without_network(monkeypatch: pytest.MonkeyPatch) -
     service = _stub_service(urls)
     assert service._checker is not None
 
-    result = asyncio.run(service._checker.probe("deepseek-chat", "deepseek"))
+    result = run(service._checker.probe("deepseek-chat", "deepseek"))
     assert result.status == "no_key"
     assert urls == []
 
@@ -891,7 +933,7 @@ def _refresh(fx: FxRate) -> dict[str, Any]:
         finally:
             await fx.aclose()
 
-    return asyncio.run(scenario())
+    return run(scenario())
 
 
 def test_fx_reads_the_first_source() -> None:
@@ -921,7 +963,7 @@ def test_fx_keeps_the_last_good_rate_when_every_source_fails() -> None:
         finally:
             await fx.aclose()
 
-    outcome = asyncio.run(scenario())
+    outcome = run(scenario())
     assert outcome["status"] == "fallback"
     # The previous good rate, not the bundled constant.
     assert fx.cny_per_usd == 6.714383
@@ -964,7 +1006,7 @@ def test_dashboard_payload_carries_the_live_rate() -> None:
         await fx.refresh()
         await fx.aclose()
 
-    asyncio.run(prime())
+    run(prime())
     # The route only reads the cached attribute; the client is never driven from a
     # second event loop, which is what deadlocks httpx on Linux.
     api.routes.fx_rate = fx
@@ -986,7 +1028,7 @@ def test_read_path_still_makes_no_outbound_request_with_fx() -> None:
         await fx.refresh()
         await fx.aclose()
 
-    asyncio.run(prime())
+    run(prime())
     api.routes.fx_rate = fx
     assert _client(_stub_service(urls)).get("/api/models").status_code == 200
     assert urls == []
