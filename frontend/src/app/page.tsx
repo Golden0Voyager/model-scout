@@ -23,8 +23,10 @@ import {
   ArrowUpDown,
   Gem,
   GripVertical,
+  Settings2,
 } from "lucide-react";
 import ModelModal from "./components/ModelModal";
+import SettingsModal from "./components/SettingsModal";
 import { formatContext, formatPrice, latencyColor } from "../lib/format";
 import {
   DndContext,
@@ -169,6 +171,7 @@ export default function Home() {
   const [scanningProviders, setScanningProviders] = useState<Set<string>>(new Set());
   const [scanningModels, setScanningModels] = useState<Set<string>>(new Set());
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [providerOrder, setProviderOrder] = useState<string[]>(() => {
     if (typeof window !== "undefined") {
       try {
@@ -505,6 +508,14 @@ export default function Home() {
               {isScanning ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
               {isScanning ? "Scanning" : "Sync"}
             </button>
+            <button
+              onClick={() => setSettingsOpen(true)}
+              className="p-2 rounded-lg text-slate-400 bg-slate-900 border border-slate-800 hover:text-white hover:border-slate-700 transition-all"
+              title="Provider settings"
+              aria-label="Provider settings"
+            >
+              <Settings2 className="w-4 h-4" />
+            </button>
           </div>
         </div>
 
@@ -780,6 +791,12 @@ export default function Home() {
             : false
         }
         cnyPerUsd={data?.cny_per_usd}
+      />
+
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        onChanged={fetchData}
       />
     </main>
   );
