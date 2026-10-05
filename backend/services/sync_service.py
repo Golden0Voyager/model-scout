@@ -8,11 +8,14 @@ from typing import Any
 
 from core.config import PROVIDERS, ModelConfig, get_provider_config, get_static_models
 from core.database import (
+    clear_retirement,
     get_all_health,
     get_last_scan_time,
+    get_retirements,
     init_db,
     log_scan_finish,
     log_scan_start,
+    retire_model,
     set_provider_pref,
     upsert_health,
 )
@@ -34,6 +37,13 @@ class SyncService:
         self._scan_lock = asyncio.Lock()
         self._last_scan_started = 0.0
         self._background_scan: asyncio.Task[None] | None = None
+        # (provider_key, model_id) the upstream no longer serves. Loaded at startup so
+        # a restart does not resurrect dead models for one scan.
+        self._retired: set[tuple[str, str]] = set()
+        # provider_key -> the ids its /models listed during the current scan, before any
+        # filtering. Retirement reads this: it is the live catalogue the scan actually
+        # saw, whether discovery or probing pulled it.
+        self._listed: dict[str, set[str]] = {}
 
     async def acquire_scan(self) -> str | None:
         """Atomically claim the single scan slot. Returns None on success, else a verdict."""
@@ -65,6 +75,7 @@ class SyncService:
         """Discover models from dynamic providers that are currently switched on."""
         if not self._checker:
             return
+        self._listed = {}
         discovered: list[ModelConfig] = []
         static_keys = {(m.provider, m.id) for m in get_static_models()}
 
@@ -77,10 +88,13 @@ class SyncService:
             # OpenRouter: detailed discovery, keep free models only
             if provider_key == "openrouter":
                 models_info, error = await self._checker.discover_models_detailed(provider_key)
-                if not models_info:
+                if models_info is None:
                     if error:
                         print(f"⚠️ Discovery failed for {provider.name}: {error}")
                     continue
+                self._listed[provider_key] = {
+                    str(info["id"]) for info in models_info if info.get("id")
+                }
                 free_models = [m for m in models_info if m.get("is_free")]
                 for info in free_models:
                     mid = info["id"]
@@ -106,10 +120,13 @@ class SyncService:
             # Providers whose /models carries per-model metadata (Moonshot, SenseNova).
             if provider.rich_discovery:
                 models_info, error = await self._checker.discover_models_detailed(provider_key)
-                if not models_info:
+                if models_info is None:
                     if error:
                         print(f"⚠️ Discovery failed for {provider.name}: {error}")
                     continue
+                self._listed[provider_key] = {
+                    str(info["id"]) for info in models_info if info.get("id")
+                }
                 for info in models_info:
                     mid = info["id"]
                     if (provider_key, mid) in static_keys:
@@ -134,10 +151,15 @@ class SyncService:
 
             # Other providers: standard ID-only discovery
             model_ids, error = await self._checker.discover_models(provider_key)
-            if not model_ids:
+            if model_ids is None:
                 if error:
                     print(f"⚠️ Discovery failed for {provider.name}: {error}")
                 continue
+            self._listed[provider_key] = {
+                # Gemini prefixes its ids with "models/" while every caller uses the bare
+                # id. Recorded unnormalised, a live model would look unlisted.
+                mid.removeprefix("models/") for mid in model_ids
+            }
             for mid in model_ids:
                 # Gemini API returns IDs with "models/" prefix — strip it
                 if mid.startswith("models/"):
@@ -146,7 +168,7 @@ class SyncService:
                     continue
                 # Skip non-chat models (embedding, image gen, video, audio, TTS, etc.)
                 _skip = ["embedding", "imagen", "veo", "lyria", "deep-research",
-                         "-tts", "-audio", "-live", "-image-preview", "robotics",
+                         "-tts", "-asr", "-audio", "-live", "-image-preview", "robotics",
                          "computer-use", "aqa", "antigravity", "nano-banana",
                          "-customtools"]
                 if any(k in mid.lower() for k in _skip):
@@ -179,8 +201,17 @@ class SyncService:
         if discovered:
             print(f"🔎 Discovered {len(discovered)} new models from dynamic providers")
 
+    def _visible(self, models: list[ModelConfig]) -> list[ModelConfig]:
+        """Drop models the upstream has stopped serving.
+
+        A pinned row is not a claim that the model still exists, so it yields to what
+        the live catalogue and the provider's own answer say about it.
+        """
+        return [m for m in models if (m.provider, m.id) not in self._retired]
+
     async def initialize(self) -> None:
         await init_db()
+        self._retired = set(await get_retirements())
         self._checker = HealthChecker(proxy=self.proxy)
         await self._checker.__aenter__()
 
@@ -232,7 +263,11 @@ class SyncService:
         if not (await effective_enabled()).get(provider_key, False):
             return f"provider_disabled:{provider_key}"
 
-        models = [m for m in self._get_all_models() if m.provider == provider_key and m.probe_mode != "none"]
+        models = [
+            m
+            for m in self._visible(self._get_all_models())
+            if m.provider == provider_key and m.probe_mode != "none"
+        ]
         if not models:
             return f"no_probeable_models:{provider_key}"
 
@@ -262,7 +297,7 @@ class SyncService:
             # Discover new models from dynamic providers first
             await self._refresh_discovered_models(enabled)
 
-            models = self._get_all_models()
+            models = self._visible(self._get_all_models())
             probeable: list[ModelConfig] = []
             skipped: list[ModelConfig] = []
             for m in models:
@@ -274,7 +309,7 @@ class SyncService:
 
             print(f"🔍 Starting health check for {len(probes)} models ({len(skipped)} skipped)...")
             results: list[ProbeResult] = await checker.probe_batch(probes, concurrency=6)
-
+            retired_now = await self._apply_retirements(checker, results)
             online_count = 0
             for r in results:
                 if r.status == "online":
@@ -304,12 +339,15 @@ class SyncService:
 
             duration = (datetime.now(UTC) - start_time).total_seconds()
             print(f"✅ Sync complete in {duration:.1f}s: {online_count}/{len(probes)} online ({len(skipped)} skipped)")
+            if retired_now:
+                print(f"🗑️  Retired {retired_now} model(s) the upstream no longer serves")
 
             return {
                 "status": "success",
                 "checked": len(probes),
                 "online": online_count,
                 "skipped": len(skipped),
+                "retired": retired_now,
                 "duration_sec": duration,
             }
 
@@ -317,6 +355,69 @@ class SyncService:
             await log_scan_finish(scan_id, 0, 0, error=str(e)[:200])
             print(f"❌ Sync failed: {e}")
             return {"status": "error", "message": str(e)}
+
+    def _catalogue_seen(self, checker: HealthChecker, provider_key: str) -> set[str] | None:
+        """The ids this provider listed during the current scan, or None if unknown.
+
+        Discovery records the list even for providers whose per-model metadata path
+        never touches the probe cache, so both routes count as evidence.
+        """
+        listed = self._listed.get(provider_key)
+        return listed if listed is not None else checker.listed_ids(provider_key)
+
+    async def _apply_retirements(
+        self,
+        checker: HealthChecker,
+        results: list[ProbeResult],
+        providers: set[str] | None = None,
+    ) -> int:
+        """Retire models the upstream proved gone, and revive the ones that came back.
+
+        Two signals must agree inside one scan before a row disappears: the provider's
+        own chat endpoint has to reject the model by identity, and its freshly fetched
+        catalogue has to omit it. Either signal alone is unreliable — DeepSeek returns a
+        two-entry /models while still serving deepseek-chat, and a rate limit or an empty
+        balance says nothing about whether the model exists.
+
+        `providers` limits the sweep to the providers a refresh actually touched, so
+        refreshing one does not go reading other providers' catalogues.
+
+        Returns how many rows were newly retired.
+        """
+        retired_now = 0
+        for r in results:
+            if r.status != "offline" or (r.provider, r.model_id) in self._retired:
+                continue
+            listed = self._catalogue_seen(checker, r.provider)
+            if listed is None or r.model_id in listed:
+                continue
+            await retire_model(r.provider, r.model_id)
+            self._retired.add((r.provider, r.model_id))
+            retired_now += 1
+
+        pending = [
+            (provider_key, model_id)
+            for provider_key, model_id in sorted(self._retired)
+            if providers is None or provider_key in providers
+        ]
+        for provider_key, model_id in pending:
+            listed = self._catalogue_seen(checker, provider_key)
+            if listed is None:
+                # Retired models are never probed, so nothing else would have pulled
+                # this provider's catalogue. Without this one free GET a provider
+                # whose every model is retired could never revive itself. The lookup
+                # is cached per provider, so repeated retired rows cost one request.
+                provider = get_provider_config(provider_key)
+                if provider is None or provider.discovery != "dynamic" or not provider.models_endpoint:
+                    continue
+                await checker.discover_models(provider_key)
+                listed = self._catalogue_seen(checker, provider_key)
+            if listed is not None and model_id in listed:
+                await clear_retirement(provider_key, model_id)
+                self._retired.discard((provider_key, model_id))
+                print(f"♻️  {provider_key}/{model_id} is back on the catalogue")
+
+        return retired_now
 
     async def probe_single_model(self, model_id: str, provider_key: str) -> ProbeResult:
         """Probe a single model and persist result."""
@@ -343,6 +444,7 @@ class SyncService:
         checker.reset_model_cache()
         probes = [{"model_id": m.id, "provider": m.provider} for m in models]
         results = await checker.probe_batch(probes, concurrency=6)
+        retired_now = await self._apply_retirements(checker, results, {provider_key})
 
         online_count = 0
         for r in results:
@@ -362,6 +464,7 @@ class SyncService:
             "provider": provider_key,
             "checked": len(probes),
             "online": online_count,
+            "retired": retired_now,
         }
 
     async def set_provider_enabled(self, provider_key: str, enabled: bool) -> None:
@@ -377,18 +480,25 @@ class SyncService:
         """Every declared provider with its switch position and catalogue size.
 
         Unlike the dashboard this lists disabled providers too — it is the screen the
-        user switches them from, so hiding them here would lock them out.
+        user switches them from, so hiding them here would lock them out. Retired
+        models are counted separately, because they are hidden but still restorable.
         """
         enabled = await effective_enabled()
         health_rows = await get_all_health()
-        online: dict[str, int] = {}
-        for row in health_rows:
-            if row["status"] == "online":
-                online[row["provider"]] = online.get(row["provider"], 0) + 1
+        online_keys = {
+            (row["provider"], row["model_id"]) for row in health_rows if row["status"] == "online"
+        }
 
         counts: dict[str, int] = {}
-        for m in self._get_all_models():
+        online: dict[str, int] = {}
+        for m in self._visible(self._get_all_models()):
             counts[m.provider] = counts.get(m.provider, 0) + 1
+            if (m.provider, m.id) in online_keys:
+                online[m.provider] = online.get(m.provider, 0) + 1
+
+        retired: dict[str, int] = {}
+        for provider_key, _model_id in self._retired:
+            retired[provider_key] = retired.get(provider_key, 0) + 1
 
         return [
             {
@@ -398,9 +508,32 @@ class SyncService:
                 "default_enabled": provider.default_enabled,
                 "model_count": counts.get(key, 0),
                 "online_count": online.get(key, 0),
+                "retired_count": retired.get(key, 0),
             }
             for key, provider in PROVIDERS.items()
         ]
+
+    async def get_retired_models(self) -> list[dict[str, Any]]:
+        """What the upstream stopped serving, and when we proved it.
+
+        The dashboard hides these rows, so without a list of their own the operator
+        could neither see what was dropped nor bring any of it back.
+        """
+        stored = await get_retirements()
+        return [
+            {
+                "provider": provider_key,
+                "provider_name": PROVIDERS[provider_key].name if provider_key in PROVIDERS else provider_key,
+                "model_id": model_id,
+                "retired_at": when,
+            }
+            for (provider_key, model_id), when in sorted(stored.items())
+        ]
+
+    async def restore_model(self, provider_key: str, model_id: str) -> None:
+        """Undo a retirement. The next scan probes it again and re-judges the evidence."""
+        await clear_retirement(provider_key, model_id)
+        self._retired.discard((provider_key, model_id))
 
     async def get_dashboard_data(self) -> dict[str, Any]:
         """Combine the model catalog with the latest persisted health data.
@@ -409,10 +542,13 @@ class SyncService:
         explicit scan requests, never by a dashboard poll.
 
         Providers switched off in settings are left out entirely — the counts describe
-        what the user is actually monitoring, not the whole catalogue.
+        what the user is actually monitoring, not the whole catalogue. Models the
+        upstream stopped serving are left out too; they stay restorable from settings.
         """
         enabled = await effective_enabled()
-        models = [m for m in self._get_all_models() if enabled.get(m.provider, False)]
+        models = [
+            m for m in self._visible(self._get_all_models()) if enabled.get(m.provider, False)
+        ]
         health_rows = await get_all_health()
         health_map: dict[str, dict[str, Any]] = {
             f"{r['provider']}::{r['model_id']}": r for r in health_rows

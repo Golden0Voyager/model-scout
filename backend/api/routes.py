@@ -10,6 +10,7 @@ from core.models import (
     DashboardResponse,
     ProviderSettingsResponse,
     ProviderToggleRequest,
+    RetiredModelsResponse,
     ScanTriggerResponse,
 )
 from core.provider_state import is_enabled
@@ -159,3 +160,27 @@ async def set_provider(
     # The whole list comes back so the switch settles on its stored value rather than
     # on whatever the browser last rendered.
     return {"providers": await service.get_provider_settings()}
+
+
+@router.get("/retirements", response_model=RetiredModelsResponse)
+async def get_retirements_list() -> dict[str, Any]:
+    """Models the upstream stopped serving. The dashboard hides them, settings shows them."""
+    return {"retired": await _service().get_retired_models()}
+
+
+@router.delete(
+    "/retirements/{provider_key}/{model_id:path}",
+    response_model=RetiredModelsResponse,
+    dependencies=[Depends(require_trusted_origin)],
+)
+async def restore_model(provider_key: str, model_id: str) -> dict[str, Any]:
+    """Bring a retired model back onto the dashboard, evidence and all.
+
+    The next scan probes it again, so a model that really is gone retires itself a
+    second time instead of staying visible on the strength of this one click.
+    """
+    if get_provider_config(provider_key) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown provider: {provider_key}")
+    service = _service()
+    await service.restore_model(provider_key, model_id)
+    return {"retired": await service.get_retired_models()}

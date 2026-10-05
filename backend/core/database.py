@@ -89,6 +89,47 @@ async def init_db() -> None:
                 updated_at TEXT NOT NULL
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS model_retirements (
+                provider_key TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                retired_at TEXT NOT NULL,
+                PRIMARY KEY (provider_key, model_id)
+            )
+        """)
+        await db.commit()
+
+
+async def get_retirements() -> dict[tuple[str, str], str]:
+    """Every retired model, keyed by (provider, model_id)."""
+    async with connect() as db, db.execute(
+        "SELECT provider_key, model_id, retired_at FROM model_retirements"
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return {(row[0], row[1]): row[2] for row in rows}
+
+
+async def retire_model(provider_key: str, model_id: str) -> None:
+    now = datetime.now(UTC).isoformat()
+    async with write_lock(), connect() as db:
+        await db.execute(
+            """
+            INSERT INTO model_retirements (provider_key, model_id, retired_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(provider_key, model_id) DO UPDATE SET
+                retired_at=excluded.retired_at
+            """,
+            (provider_key, model_id, now),
+        )
+        await db.commit()
+
+
+async def clear_retirement(provider_key: str, model_id: str) -> None:
+    async with write_lock(), connect() as db:
+        await db.execute(
+            "DELETE FROM model_retirements WHERE provider_key=? AND model_id=?",
+            (provider_key, model_id),
+        )
         await db.commit()
 
 

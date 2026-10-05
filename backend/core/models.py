@@ -42,6 +42,18 @@ class ProviderSetting(BaseModel):
     default_enabled: bool
     model_count: int
     online_count: int
+    retired_count: int = 0
+
+
+class RetiredModel(BaseModel):
+    provider: str
+    provider_name: str
+    model_id: str
+    retired_at: str
+
+
+class RetiredModelsResponse(BaseModel):
+    retired: list[RetiredModel]
 
 
 class ProviderSettingsResponse(BaseModel):
