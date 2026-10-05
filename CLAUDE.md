@@ -40,6 +40,7 @@ npm run dev
 - **`core/database.py`**：aiosqlite 异步数据库操作，存储健康状态历史、provider 开关与退役记录
 - **`core/provider_state.py`**：运行时开关的唯一读取入口。`effective_enabled()` 把库里的用户选择叠加在 config 默认之上；库里没有记录的 provider 走默认值
 - **`services/health_checker.py`**：健康探测引擎。支持 models_endpoint 探测（免费）和 chat_ping（最小 token 成本），目录缓存 120 秒且失败也缓存。`is_model_missing()` 把各家写法不同的「这个模型没了」归成一类；`listed_ids()` 给出本轮真正拉到的目录（拉取失败返回 None，不能当证据）
+- **两种定价外形**：`_pricing_info()` 按发布格式换算，别再用统一乘数。OpenRouter / SenseNova 的 `pricing.prompt` 是 **USD 每 token**（乘 1e6）；TokenRhythm 带 `unit: "per_1m_tokens"`，给的已经是 **CNY 每 1M**（不乘），且 `pricing` 是原价、`effective_input/output_price_per_million` 才是账号实付价，面板显示后者、`has_discount` 时标「限时折扣」。用错乘数就是一百万倍的误差
 - **`services/sync_service.py`**：同步调度服务。`acquire_scan()` 提供原子扫描槽位，`MIN_SCAN_INTERVAL_SECONDS` 提供冷却，探测为 6 并发 + 150ms 间隔；`_apply_retirements()` 在每轮扫描末尾裁决退役与复活
 - **`core/access.py`**：扫描接口的访问控制。`ALLOWED_ORIGINS` 校验请求来源，`probe_limiter` 为单模型探测提供滑动窗口限流
 - **`services/fx.py`**：`FxRate` 保存 USD/CNY 参考汇率。由后台任务按 `FX_REFRESH_SECONDS` 刷新，取不到时保留上一次好值、最终回退到 `FALLBACK_CNY_PER_USD`
@@ -104,5 +105,6 @@ cd frontend && npm run lint && npx tsc --noEmit
 - **钉住的模型对实时结果退让**：同一轮扫描里同时满足①该 provider 的 `/models` 抓取成功且不含它，②chat ping 回「模型不存在」类错误（`is_model_missing()`：`Model Not Exist` / `Unsupported model` / `model_not_found` / `not found` / `does not exist`），才写入 `model_retirements` 并从面板与探测中一起移除。单独任一信号都不成立：DeepSeek 的 `/models` 只有两条，可 `deepseek-chat` 实测能通，按列表一刀切就会误删活模型；429、余额不足、超时同样不构成证据，宁可留着。**不要用 `if not models_info` 判断抓取失败**——空目录是成功，必须写 `is None`，否则「上游真的把这一代全撤了」反而拿不到证据
 - **退役会自动复活**：退役行不再探测，但每轮扫描仍按目录判定；模型重新出现在 `/models` 里就自动撤销退役。若某 provider 全部模型都退役、本轮没人触发它的目录抓取，`_apply_retirements()` 会补一次免费 `discover_models()`（走缓存，同 provider 只发一次）——否则这种 provider 就永远没有翻身的机会
 - **Restore 不是永久豁免**：`DELETE /api/retirements/{provider}/{model}` 只把裁决推倒重来，面板立刻可见，下一轮扫描（或该 provider 的定向刷新）按同样两个信号重判
+- **目录优先来自 `/models`**：新增 provider 不要照网页快照钉 `STATIC_MODELS`——上游列表会变、网页还可能混进按张计费的图像模型。实时发现已经安全：漂移由上面的双证据退役机制自己处理。只有当 `/models` 不提供更多的元数据、或该 provider 根本没有 `/models` 时才钉行。目前 tokenrhythm 走 100% 实时（0 静态行、`rich_discovery=True`）
 - **`probe_mode="none"`**：仍然支持的**模型级**开关，但目前没有任何静态条目使用它——三个坏掉的 provider 都改用上面的运行时开关
 - **被关掉的 provider 无法定向扫描**：`POST /api/scan/{provider}` 与单模型扫描会返回 409，提示去设置页打开

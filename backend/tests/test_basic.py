@@ -231,6 +231,33 @@ def test_retired_sensenova_catalog_is_not_pinned_in_config() -> None:
     assert [m.id for m in get_models_for_provider("sensenova")] == []
 
 
+def test_tokenrhythm_matches_its_published_access_details() -> None:
+    """Docs specify https://tokenrhythm.studio/v1 with `Authorization: Bearer sk_xxx`."""
+    provider = get_provider_config("tokenrhythm")
+    assert provider is not None
+    assert provider.base_url == "https://tokenrhythm.studio/v1"
+    assert provider.api_key_env == "TOKENRHYTHM_API_KEY"
+    assert provider.auth_style == "bearer"
+    # Measured from this machine: the host answers unproxied, so it must not be
+    # routed through the overseas proxy.
+    assert provider.network == "direct"
+    assert provider.discovery == "dynamic"
+    assert provider.auto_discover is True
+    # Measured: its /models carries context, max output, per-1M prices and per-model
+    # capability booleans, so the rich path is the one that keeps real metadata.
+    assert provider.rich_discovery is True
+
+
+def test_tokenrhythm_catalogue_is_not_pinned_in_config() -> None:
+    """What the account can call is an upstream fact, not a repo fact.
+
+    The published model page carries 25 entries, two of which bill per generated
+    image; pinning any of them would freeze a snapshot the provider never promised
+    to keep, and would put image generators into a chat monitor.
+    """
+    assert [m.id for m in get_models_for_provider("tokenrhythm")] == []
+
+
 def test_rich_discovery_drives_metadata_not_provider_names() -> None:
     """The rich path must be selected by config, not by an `if provider_key == ...` arm."""
     import inspect
@@ -282,6 +309,116 @@ def test_moonshot_still_discovers_through_the_generalised_path(monkeypatch: pyte
     run(service._refresh_discovered_models(run(effective_enabled())))
     moonshot = [m for m in service._discovered_models if m.provider == "moonshot"]
     assert {m.id for m in moonshot} == {"sensenova-6.8-flash-lite", "deepseek-v4-pro"}
+
+
+# Transcribed from the live https://tokenrhythm.studio/v1/models on 2026-10-05. Note that
+# prices are per 1M tokens and that base and discounted rates are published separately.
+TOKENRHYTHM_CATALOG: dict[str, Any] = {
+    "data": [
+        {
+            "id": "glm-5.1",
+            "owned_by": "tokenrhythm",
+            "context_length": 200000,
+            "max_completion_tokens": 128000,
+            "currency": "CNY",
+            "pricing": {
+                "currency": "CNY",
+                "unit": "per_1m_tokens",
+                "prompt": "8.00000000",
+                "completion": "28.00000000",
+            },
+            "effective_input_price_per_million": "8.00000000",
+            "effective_output_price_per_million": "28.00000000",
+            "has_discount": False,
+            "supports_vision": False,
+            "supports_tools": True,
+            "supports_reasoning": True,
+        },
+        {
+            "id": "qwen3.7-max",
+            "owned_by": "tokenrhythm",
+            "context_length": 1000000,
+            "max_completion_tokens": 131072,
+            "currency": "CNY",
+            "pricing": {
+                "currency": "CNY",
+                "unit": "per_1m_tokens",
+                "prompt": "12.00000000",
+                "completion": "36.00000000",
+            },
+            "effective_input_price_per_million": "6.00000000",
+            "effective_output_price_per_million": "18.00000000",
+            "has_discount": True,
+            "supports_vision": False,
+            "supports_tools": True,
+            "supports_reasoning": True,
+        },
+        {
+            "id": "neohorse-1-9b",
+            "owned_by": "tokenrhythm",
+            "context_length": 262144,
+            "max_completion_tokens": 32768,
+            "currency": "CNY",
+            "pricing": {
+                "currency": "CNY",
+                "unit": "per_1m_tokens",
+                "prompt": "0.60000000",
+                "completion": "1.00000000",
+            },
+            "effective_input_price_per_million": "0.00000000",
+            "effective_output_price_per_million": "0.00000000",
+            "has_discount": True,
+            "supports_vision": False,
+            "supports_tools": True,
+            "supports_reasoning": False,
+        },
+    ]
+}
+
+
+def test_per_million_prices_are_not_rescaled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenRouter gives USD per token, TokenRhythm gives CNY per 1M tokens.
+
+    Applying the per-token multiplier to the second shape would have published
+    ¥8,000,000 per million tokens, so the published unit has to drive the scale.
+    """
+    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "test-key")
+    service = _service_with_payload(TOKENRHYTHM_CATALOG, monkeypatch)
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    by_id = {m.id: m for m in service._discovered_models if m.provider == "tokenrhythm"}
+    glm = by_id["glm-5.1"]
+    assert glm.pricing_input_per_1m == 8.0
+    assert glm.pricing_output_per_1m == 28.0
+    assert glm.pricing_currency == "CNY"
+    assert glm.max_output_tokens == 128000
+    assert set(glm.capabilities) == {"chat", "function_calling", "reasoning"}
+    assert "long_context" not in glm.capabilities
+
+
+def test_the_rate_the_account_pays_is_the_one_displayed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TokenRhythm publishes base and discounted prices; the panel shows the effective one."""
+    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "test-key")
+    service = _service_with_payload(TOKENRHYTHM_CATALOG, monkeypatch)
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    by_id = {m.id: m for m in service._discovered_models if m.provider == "tokenrhythm"}
+    assert by_id["qwen3.7-max"].pricing_input_per_1m == 6.0
+    assert by_id["qwen3.7-max"].pricing_note == "限时折扣"
+    assert "long_context" in by_id["qwen3.7-max"].capabilities
+    assert by_id["neohorse-1-9b"].is_free is True
+
+
+def test_per_token_publishers_keep_the_old_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A `pricing` object without a unit is OpenRouter's per-token USD shape; it must not drift."""
+    service = _service_with_payload(RICH_CATALOG, monkeypatch)
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    by_id = {m.id: m for m in service._discovered_models if m.provider == "moonshot"}
+    pro = by_id["deepseek-v4-pro"]
+    assert pro.pricing_input_per_1m == 20_000.0
+    assert pro.pricing_currency == "USD"
+    assert pro.pricing_note == ""
 
 
 # ---------------------------------------------------------------- provider switch
