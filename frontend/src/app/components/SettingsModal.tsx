@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { X, RefreshCw, EyeOff, AlertCircle } from "lucide-react";
+import { X, RefreshCw, EyeOff, AlertCircle, RotateCcw, Archive } from "lucide-react";
 
 interface ProviderSetting {
   key: string;
@@ -10,6 +10,14 @@ interface ProviderSetting {
   default_enabled: boolean;
   model_count: number;
   online_count: number;
+  retired_count: number;
+}
+
+interface RetiredModel {
+  provider: string;
+  provider_name: string;
+  model_id: string;
+  retired_at: string;
 }
 
 interface SettingsModalProps {
@@ -19,8 +27,15 @@ interface SettingsModalProps {
   onChanged?: () => void;
 }
 
+function formatRetiredAt(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "--";
+  return d.toLocaleDateString("zh-CN", { month: "short", day: "numeric" });
+}
+
 export default function SettingsModal({ open, onClose, onChanged }: SettingsModalProps) {
   const [providers, setProviders] = useState<ProviderSetting[] | null>(null);
+  const [retired, setRetired] = useState<RetiredModel[]>([]);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -37,26 +52,31 @@ export default function SettingsModal({ open, onClose, onChanged }: SettingsModa
     };
   }, [open, onClose]);
 
+  const load = useCallback(async () => {
+    try {
+      const [settings, retirements] = await Promise.all([
+        fetch("/api/providers"),
+        fetch("/api/retirements"),
+      ]);
+      if (!settings.ok || !retirements.ok) throw new Error("HTTP");
+      const providersJson: { providers: ProviderSetting[] } = await settings.json();
+      const retiredJson: { retired: RetiredModel[] } = await retirements.json();
+      setProviders(providersJson.providers);
+      setRetired(retiredJson.retired);
+      setError(null);
+    } catch {
+      setError("Could not load settings");
+    }
+  }, []);
+
   useEffect(() => {
-    if (!open) return;
-    let cancelled = false;
-    setError(null);
-    fetch("/api/providers")
-      .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
-      .then((json: { providers: ProviderSetting[] }) => {
-        if (!cancelled) setProviders(json.providers);
-      })
-      .catch(() => {
-        if (!cancelled) setError("Could not load providers");
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open]);
+    if (open) void load();
+  }, [open, load]);
 
   const toggle = useCallback(
     async (key: string, enabled: boolean) => {
-      setPending(key);
+      const id = `provider:${key}`;
+      setPending(id);
       setError(null);
       try {
         const res = await fetch(`/api/providers/${key}`, {
@@ -77,6 +97,29 @@ export default function SettingsModal({ open, onClose, onChanged }: SettingsModa
       }
     },
     [onChanged]
+  );
+
+  const restore = useCallback(
+    async (provider: string, modelId: string) => {
+      const id = `retired:${provider}:${modelId}`;
+      setPending(id);
+      setError(null);
+      try {
+        const res = await fetch(
+          `/api/retirements/${encodeURIComponent(provider)}/${encodeURIComponent(modelId)}`,
+          { method: "DELETE" }
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        // Both lists moved: the model is back and its provider's counts went with it.
+        await load();
+        onChanged?.();
+      } catch {
+        setError(`Could not restore ${modelId}`);
+      } finally {
+        setPending(null);
+      }
+    },
+    [load, onChanged]
   );
 
   if (!open) return null;
@@ -145,17 +188,20 @@ export default function SettingsModal({ open, onClose, onChanged }: SettingsModa
                     </div>
                     <div className="text-[11px] text-slate-500 font-mono mt-0.5">
                       {p.key} · {p.online_count}/{p.model_count} online
+                      {p.retired_count > 0 && (
+                        <span className="text-slate-600"> · {p.retired_count} retired</span>
+                      )}
                     </div>
                   </div>
                   <button
                     role="switch"
                     aria-checked={p.enabled}
                     aria-label={`Toggle ${p.name}`}
-                    disabled={pending === p.key}
+                    disabled={pending === `provider:${p.key}`}
                     onClick={() => toggle(p.key, !p.enabled)}
                     className={`relative shrink-0 w-10 h-6 rounded-full transition-colors ${
                       p.enabled ? "bg-indigo-600" : "bg-slate-700"
-                    } ${pending === p.key ? "opacity-50 cursor-wait" : "hover:opacity-90"}`}
+                    } ${pending === `provider:${p.key}` ? "opacity-50 cursor-wait" : "hover:opacity-90"}`}
                   >
                     <span
                       className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${
@@ -166,6 +212,55 @@ export default function SettingsModal({ open, onClose, onChanged }: SettingsModa
                 </li>
               ))}
             </ul>
+          )}
+
+          {providers && retired.length > 0 && (
+            <div className="mt-5 pt-4 border-t border-slate-800">
+              <div className="flex items-center gap-2 mb-1">
+                <Archive className="w-3.5 h-3.5 text-slate-500" />
+                <span className="text-xs font-medium text-slate-300">Retired by upstream</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
+                  {retired.length}
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-500 mb-3 leading-relaxed">
+                The provider rejected these by name and no longer lists them, so they are hidden
+                and no longer cost a probe. Anything that reappears upstream revives itself.
+              </p>
+              <ul className="space-y-1">
+                {retired.map((r) => {
+                  const id = `retired:${r.provider}:${r.model_id}`;
+                  return (
+                    <li
+                      key={id}
+                      className="flex items-center justify-between gap-3 py-2 px-3 -mx-3 rounded-lg hover:bg-slate-800/40 transition-colors"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-[13px] text-slate-200 font-mono truncate">
+                          {r.model_id}
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-0.5">
+                          {r.provider_name} · retired {formatRetiredAt(r.retired_at)}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => restore(r.provider, r.model_id)}
+                        disabled={pending === id}
+                        aria-label={`Restore ${r.model_id}`}
+                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-medium border transition-all shrink-0 ${
+                          pending === id
+                            ? "border-slate-700 text-slate-600 cursor-wait"
+                            : "border-slate-700 text-slate-400 hover:text-white hover:bg-slate-800"
+                        }`}
+                      >
+                        <RotateCcw className={`w-3 h-3 ${pending === id ? "animate-spin" : ""}`} />
+                        Restore
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
           )}
         </div>
 
