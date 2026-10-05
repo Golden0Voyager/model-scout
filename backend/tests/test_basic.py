@@ -37,8 +37,9 @@ from core.config import (
     get_models_for_provider,
     get_provider_config,
     get_static_models,
-    provider_enabled,
+    provider_default_enabled,
 )
+from core.provider_state import effective_enabled, is_enabled
 from services.fx import SOURCES, FxRate
 from services.health_checker import HealthChecker, ProbeResult
 from services.sync_service import SyncService
@@ -128,10 +129,16 @@ class Api:
         api.routes.sync_service = service
         self._transport = ASGITransport(app=app)
 
-    def _call(self, method: str, path: str, headers: dict[str, str] | None):
+    def _call(
+        self,
+        method: str,
+        path: str,
+        headers: dict[str, str] | None,
+        body: dict[str, Any] | None = None,
+    ):
         async def request() -> httpx.Response:
             async with httpx.AsyncClient(transport=self._transport, base_url="http://dashboard") as client:
-                return await client.request(method, path, headers=headers or {})
+                return await client.request(method, path, headers=headers or {}, json=body)
 
         return run(request())
 
@@ -140,6 +147,9 @@ class Api:
 
     def post(self, path: str, headers: dict[str, str] | None = None) -> httpx.Response:
         return self._call("POST", path, headers)
+
+    def put(self, path: str, body: dict[str, Any]) -> httpx.Response:
+        return self._call("PUT", path, None, body)
 
 
 def _client(service: SyncService | None) -> Api:
@@ -232,7 +242,7 @@ def test_rich_discovery_drives_metadata_not_provider_names() -> None:
 
 def test_rich_catalog_populates_every_advertised_field(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
-    run(service._refresh_discovered_models())
+    run(service._refresh_discovered_models(run(effective_enabled())))
 
     by_id = {m.id: m for m in service._discovered_models if m.provider == "sensenova"}
     lite = by_id["sensenova-6.8-flash-lite"]
@@ -254,7 +264,7 @@ def test_rich_catalog_populates_every_advertised_field(monkeypatch: pytest.Monke
 def test_unknown_features_do_not_leak_raw_tags(monkeypatch: pytest.MonkeyPatch) -> None:
     """json_mode has no dashboard label, so it must not surface as a raw snake_case tag."""
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
-    run(service._refresh_discovered_models())
+    run(service._refresh_discovered_models(run(effective_enabled())))
     caps = {c for m in service._discovered_models for c in m.capabilities}
     assert "json_mode" not in caps
     assert not any("_" in c and c not in {"function_calling", "long_context"} for c in caps)
@@ -262,7 +272,7 @@ def test_unknown_features_do_not_leak_raw_tags(monkeypatch: pytest.MonkeyPatch) 
 
 def test_moonshot_still_discovers_through_the_generalised_path(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
-    run(service._refresh_discovered_models())
+    run(service._refresh_discovered_models(run(effective_enabled())))
     moonshot = [m for m in service._discovered_models if m.provider == "moonshot"]
     assert {m.id for m in moonshot} == {"sensenova-6.8-flash-lite", "deepseek-v4-pro"}
 
@@ -276,11 +286,38 @@ DISABLED_MODEL_COUNTS = {"anyrouter": 11, "agentrouter": 3, "mimo": 4}
 DISABLED_HOSTS = ("agentrouter.org", "token-plan-cn.xiaomimimo.com", "anyrouter.net")
 
 
-def test_the_three_dead_providers_are_switched_off() -> None:
-    assert {k for k, p in PROVIDERS.items() if not p.enabled} == DISABLED
-    assert provider_enabled("sensenova") is True
+def test_the_three_dead_providers_default_to_off() -> None:
+    """Config carries defaults only; the settings screen owns the live switch."""
+    assert {k for k, p in PROVIDERS.items() if not p.default_enabled} == DISABLED
+    assert provider_default_enabled("sensenova") is True
     # An unknown key must not be probeable just because nobody declared it.
-    assert provider_enabled("not-a-provider") is False
+    assert provider_default_enabled("not-a-provider") is False
+
+
+def test_an_unstored_switch_falls_back_to_its_default() -> None:
+    """A fresh database has no rows, so defaults are what the user sees first."""
+    effective = run(effective_enabled())
+    assert set(effective) == set(PROVIDERS)
+    assert {k for k, v in effective.items() if not v} == DISABLED
+    assert run(is_enabled("sensenova")) is True
+    assert run(is_enabled("not-a-provider")) is False
+
+
+def test_a_stored_switch_overrides_the_default_in_both_directions() -> None:
+    """Turning a dead provider back on is the whole point, so it must win over config."""
+    run(database.set_provider_pref("anyrouter", True))
+    run(database.set_provider_pref("moonshot", False))
+    assert run(is_enabled("anyrouter")) is True
+    assert run(is_enabled("moonshot")) is False
+    # The default stays put: a later reset returns the provider to its shipped state.
+    assert provider_default_enabled("moonshot") is True
+
+
+def test_switches_survive_a_restart() -> None:
+    """Persistence is what makes this a setting rather than a request-scoped flag."""
+    run(database.set_provider_pref("agentrouter", False))
+    prefs = run(database.get_provider_prefs())
+    assert prefs == {"agentrouter": False}
 
 
 def test_provider_switch_replaced_the_per_model_flags() -> None:
@@ -290,11 +327,27 @@ def test_provider_switch_replaced_the_per_model_flags() -> None:
 
 def test_discovery_never_contacts_a_disabled_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
-    run(service._refresh_discovered_models())
+    run(service._refresh_discovered_models(run(effective_enabled())))
 
     contacted = {u for u in service.recorded_requests if any(h in u for h in DISABLED_HOSTS)}  # type: ignore[attr-defined]
     assert contacted == set()
     assert [m for m in service._discovered_models if m.provider in DISABLED] == []
+
+
+def test_discovery_follows_the_switch_not_the_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A provider switched on from settings must be reachable by discovery."""
+    async def scenario() -> tuple[set[str], list[str]]:
+        service = _service_with_payload(RICH_CATALOG, monkeypatch)
+        await database.set_provider_pref("mimo", True)
+        await service._refresh_discovered_models(await effective_enabled())
+        urls = {u for u in service.recorded_requests if "token-plan-cn.xiaomimimo.com" in u}  # type: ignore[attr-defined]
+        return urls, [m.provider for m in service._discovered_models]
+
+    urls, discovered_providers = run(scenario())
+    assert urls
+    assert "mimo" in discovered_providers
 
 
 def test_scan_skips_every_model_of_a_disabled_provider() -> None:
@@ -328,13 +381,106 @@ def test_scan_skips_every_model_of_a_disabled_provider() -> None:
 def test_scan_requests_against_a_disabled_provider_are_refused(path: str) -> None:
     response = _client(_stub_service()).post(path)
     assert response.status_code == 409
-    assert "disabled" in response.json()["detail"]
+    assert "switched off" in response.json()["detail"]
 
 
-def test_disabled_providers_stay_in_the_catalog() -> None:
-    """The panel reports which models exist; a dead key is not a reason to forget them."""
+def test_disabled_providers_are_hidden_from_the_dashboard() -> None:
+    """The user asked to switch them off, so the panel must stop showing them."""
     payload = _client(_stub_service()).get("/api/models").json()
-    assert {m["provider"] for m in payload["models"]} >= DISABLED
+    assert {m["provider"] for m in payload["models"]} & DISABLED == set()
+    assert {p["key"] for p in payload["providers"]} & DISABLED == set()
+
+
+def test_the_settings_list_shows_every_provider_including_disabled() -> None:
+    """Hiding switched-off providers here would lock the user out of switching them back.
+
+    This is the bug the feature exists to fix, so it is pinned on the endpoint that
+    serves the panel rather than on the dashboard payload.
+    """
+    payload = _client(_stub_service()).get("/api/providers").json()
+    by_key = {p["key"]: p for p in payload["providers"]}
+    assert set(by_key) == set(PROVIDERS)
+    for key in DISABLED:
+        assert by_key[key]["enabled"] is False
+        assert by_key[key]["default_enabled"] is False
+        assert by_key[key]["model_count"] == DISABLED_MODEL_COUNTS[key]
+
+
+def test_toggling_a_provider_persists_and_comes_back_on_the_list() -> None:
+    service = _stub_service([])
+
+    async def no_scan() -> None:
+        return None
+
+    # The refresh itself is another test's business; here it would start real traffic.
+    service.start_scan = no_scan  # type: ignore[method-assign]
+    client = _client(service)
+
+    response = client.put("/api/providers/anyrouter", {"enabled": True})
+    assert response.status_code == 200
+    assert {p["key"]: p["enabled"] for p in response.json()["providers"]}["anyrouter"] is True
+    assert run(database.get_provider_prefs()) == {"anyrouter": True}
+
+    # A second reader sees the stored switch, which is what a restart would do too.
+    assert {p["key"]: p["enabled"] for p in client.get("/api/providers").json()["providers"]}[
+        "anyrouter"
+    ] is True
+
+
+def test_switching_a_provider_on_starts_a_refresh() -> None:
+    """Enabling must repopulate the panel, and only a full scan can discover models."""
+    service = _stub_service([])
+    started: list[int] = []
+
+    async def fake_start_scan() -> None:
+        started.append(1)
+
+    service.start_scan = fake_start_scan  # type: ignore[method-assign]
+    run(service.set_provider_enabled("anyrouter", True))
+    assert started == [1]
+
+    run(service.set_provider_enabled("anyrouter", False))
+    assert started == [1], "switching off should not spend requests on a refresh"
+
+
+def test_toggling_an_unknown_provider_is_404() -> None:
+    response = _client(_stub_service()).put("/api/providers/not-a-provider", {"enabled": True})
+    assert response.status_code == 404
+
+
+def test_toggling_from_another_origin_is_refused() -> None:
+    """The switch is a write, so it carries the same origin guard as the scan routes."""
+    async def scenario() -> httpx.Response:
+        app = FastAPI()
+        app.include_router(router, prefix="/api")
+        api.routes.sync_service = _stub_service([])
+        async with httpx.AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://dashboard"
+        ) as client:
+            return await client.put(
+                "/api/providers/anyrouter",
+                json={"enabled": True},
+                headers={"Origin": "http://evil.example"},
+            )
+
+    response = run(scenario())
+    assert response.status_code == 403
+    assert run(database.get_provider_prefs()) == {}
+
+
+def test_dashboard_counts_follow_the_switch() -> None:
+    """Totals describe what is monitored, so they must shrink when a provider is off."""
+    client = _client(_stub_service())
+    before = client.get("/api/models").json()
+    client.put("/api/providers/moonshot", {"enabled": False})
+    after = client.get("/api/models").json()
+
+    assert after["total_models"] == before["total_models"] - _model_count("moonshot")
+    assert {p["key"] for p in after["providers"]} & DISABLED == set()
+
+
+def _model_count(provider_key: str) -> int:
+    return sum(1 for m in get_static_models() if m.provider == provider_key)
 
 
 # ---------------------------------------------------------------- catalogue caching
@@ -525,7 +671,9 @@ def test_dashboard_triggers_no_outbound_requests() -> None:
     response = _client(service).get("/api/models")
     assert response.status_code == 200
     assert service.recorded_requests == []  # type: ignore[attr-defined]
-    assert response.json()["total_models"] == len(STATIC_MODELS)
+    # Switched-off providers are hidden, so the panel reports the monitored catalogue.
+    hidden = sum(DISABLED_MODEL_COUNTS.values())
+    assert response.json()["total_models"] == len(STATIC_MODELS) - hidden
 
 
 def test_dashboard_reports_persisted_health_without_probing() -> None:
