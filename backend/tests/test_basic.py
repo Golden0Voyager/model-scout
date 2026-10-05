@@ -241,26 +241,18 @@ def test_tokenrhythm_matches_its_published_access_details() -> None:
     # Measured from this machine: the host answers unproxied, so it must not be
     # routed through the overseas proxy.
     assert provider.network == "direct"
-    # The /models envelope is not documented, so nothing beyond bare ids is assumed.
     assert provider.discovery == "dynamic"
     assert provider.auto_discover is True
-    assert provider.rich_discovery is False
 
 
-def test_tokenrhythm_catalogue_is_pinned_from_the_model_page() -> None:
-    """23 chat models as published; the two per-image generators are deliberately out."""
-    models = get_models_for_provider("tokenrhythm")
-    assert len(models) == 23
-    assert {m.id for m in models} & {"qwen-image-2.0", "wan2.7-image"} == set()
-    assert {m.probe_mode for m in models} == {"chat"}
-    assert all(m.pricing_currency == "CNY" for m in models)
-    assert all(m.context_length >= 200_000 for m in models)
-    # Capabilities have to follow the published modalities, not a blanket list.
-    by_id = {m.id: m for m in models}
-    assert "vision" in by_id["kimi-k2.6"].capabilities
-    assert "vision" not in by_id["glm-5.1"].capabilities
-    assert "coding" in by_id["kimi-k2.7-code"].capabilities
-    assert "long_context" in by_id["minimax-m2.7"].capabilities
+def test_tokenrhythm_catalogue_is_not_pinned_in_config() -> None:
+    """What the account can call is an upstream fact, not a repo fact.
+
+    The published model page carries 25 entries, two of which bill per generated
+    image; pinning any of them would freeze a snapshot the provider never promised
+    to keep, and would put image generators into a chat monitor.
+    """
+    assert [m.id for m in get_models_for_provider("tokenrhythm")] == []
 
 
 def test_rich_discovery_drives_metadata_not_provider_names() -> None:
