@@ -5,8 +5,14 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.access import PROBE_MAX_CALLS, PROBE_WINDOW_SECONDS, probe_limiter, require_trusted_origin
-from core.config import FALLBACK_CNY_PER_USD, get_provider_config, provider_enabled
-from core.models import DashboardResponse, ScanTriggerResponse
+from core.config import FALLBACK_CNY_PER_USD, get_provider_config
+from core.models import (
+    DashboardResponse,
+    ProviderSettingsResponse,
+    ProviderToggleRequest,
+    ScanTriggerResponse,
+)
+from core.provider_state import is_enabled
 from services.fx import FxRate
 from services.sync_service import SyncService
 
@@ -36,18 +42,20 @@ def _rejected(verdict: str) -> ScanTriggerResponse:
             message = f"Scans are rate limited, retry in {detail}"
         elif kind == "no_probeable_models":
             message = f"No probe-able models found for {detail}"
+        elif kind == "provider_disabled":
+            message = f"Provider '{detail}' is switched off in settings"
         else:
             message = verdict
     return ScanTriggerResponse(status="rejected", message=message)
 
 
-def _require_provider(provider_key: str) -> None:
+async def _require_provider(provider_key: str) -> None:
     if get_provider_config(provider_key) is None:
         raise HTTPException(status_code=404, detail=f"Unknown provider: {provider_key}")
-    if not provider_enabled(provider_key):
+    if not await is_enabled(provider_key):
         raise HTTPException(
             status_code=409,
-            detail=f"Provider '{provider_key}' is disabled in core/config.py",
+            detail=f"Provider '{provider_key}' is switched off in settings",
         )
 
 
@@ -101,7 +109,7 @@ async def trigger_scan() -> ScanTriggerResponse:
 )
 async def trigger_provider_scan(provider_key: str) -> ScanTriggerResponse:
     """Trigger health check for all models of a single provider."""
-    _require_provider(provider_key)
+    await _require_provider(provider_key)
     verdict = await _service().start_provider_scan(provider_key)
     if verdict is not None:
         return _rejected(verdict)
@@ -116,7 +124,7 @@ async def trigger_provider_scan(provider_key: str) -> ScanTriggerResponse:
 )
 async def trigger_model_scan(provider_key: str, model_id: str) -> dict[str, Any]:
     """Trigger health check for a single model. The ID may contain slashes."""
-    _require_provider(provider_key)
+    await _require_provider(provider_key)
     _enforce_probe_limit()
     result = await _service().probe_single_model(model_id, provider_key)
     return {
@@ -126,3 +134,28 @@ async def trigger_model_scan(provider_key: str, model_id: str) -> dict[str, Any]
         "latency_ms": result.latency_ms,
         "error_message": result.error_message,
     }
+
+
+@router.get("/providers", response_model=ProviderSettingsResponse)
+async def get_providers() -> dict[str, Any]:
+    """List every provider, switched-off ones included — that is the point of the screen."""
+    return {"providers": await _service().get_provider_settings()}
+
+
+@router.put(
+    "/providers/{provider_key}",
+    response_model=ProviderSettingsResponse,
+    dependencies=[Depends(require_trusted_origin)],
+)
+async def set_provider(
+    provider_key: str,
+    body: ProviderToggleRequest,
+) -> dict[str, Any]:
+    """Switch a provider on or off. Off hides it from the dashboard and from scans."""
+    if get_provider_config(provider_key) is None:
+        raise HTTPException(status_code=404, detail=f"Unknown provider: {provider_key}")
+    service = _service()
+    await service.set_provider_enabled(provider_key, body.enabled)
+    # The whole list comes back so the switch settles on its stored value rather than
+    # on whatever the browser last rendered.
+    return {"providers": await service.get_provider_settings()}

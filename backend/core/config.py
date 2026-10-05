@@ -48,9 +48,10 @@ class ProviderConfig:
     models_endpoint: str | None = None
     # Whether to auto-discover and add new models not in STATIC_MODELS
     auto_discover: bool = False
-    # Disabled providers keep their catalog rows on the dashboard but are never
-    # discovered or probed — for dead keys or upstreams that are down
-    enabled: bool = True
+    # Starting value for the dashboard's per-provider switch. The live value lives in
+    # the provider_settings table, so editing this only changes what a provider that
+    # has never been toggled defaults to.
+    default_enabled: bool = True
     # /models returns per-model metadata (context, modalities, features, pricing)
     # rather than bare IDs
     rich_discovery: bool = False
@@ -181,7 +182,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         api_key_env="ANYROUTER_API_KEY",
         network="proxy",
         discovery="static",
-        enabled=False,
+        default_enabled=False,
     ),
     "agentrouter": ProviderConfig(
         key="agentrouter",
@@ -193,7 +194,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         models_endpoint="/models",
         auto_discover=True,
         # /models returns 401: the key is invalid or expired
-        enabled=False,
+        default_enabled=False,
     ),
     "mimo": ProviderConfig(
         key="mimo",
@@ -206,7 +207,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         auth_style="api_key",
         auto_discover=True,
         # /models returns 401 while MIMO_PAYG_API_KEY works fine
-        enabled=False,
+        default_enabled=False,
     ),
     "mimo_payg": ProviderConfig(
         key="mimo_payg",
@@ -946,10 +947,10 @@ def get_provider_config(key: str) -> ProviderConfig | None:
     return PROVIDERS.get(key)
 
 
-def provider_enabled(key: str) -> bool:
-    """False for unknown providers too, so callers cannot probe what they cannot name."""
+def provider_default_enabled(key: str) -> bool:
+    """The config-level default; the user's choice lives in provider_settings."""
     provider = PROVIDERS.get(key)
-    return provider is not None and provider.enabled
+    return provider is not None and provider.default_enabled
 
 
 def get_static_models() -> list[ModelConfig]:

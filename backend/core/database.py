@@ -82,6 +82,36 @@ async def init_db() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_health_provider ON health_checks(provider)"
         )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS provider_settings (
+                provider_key TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        await db.commit()
+
+
+async def get_provider_prefs() -> dict[str, bool]:
+    """Stored switches only; providers with no row fall back to their config default."""
+    async with connect() as db, db.execute("SELECT provider_key, enabled FROM provider_settings") as cursor:
+        rows = await cursor.fetchall()
+    return {row[0]: bool(row[1]) for row in rows}
+
+
+async def set_provider_pref(provider_key: str, enabled: bool) -> None:
+    now = datetime.now(UTC).isoformat()
+    async with write_lock(), connect() as db:
+        await db.execute(
+            """
+            INSERT INTO provider_settings (provider_key, enabled, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(provider_key) DO UPDATE SET
+                enabled=excluded.enabled,
+                updated_at=excluded.updated_at
+            """,
+            (provider_key, int(enabled), now),
+        )
         await db.commit()
 
 

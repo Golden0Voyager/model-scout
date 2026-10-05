@@ -41,7 +41,7 @@ async def require_trusted_origin(request: Request) -> None:
     if not is_trusted_origin(origin):
         raise HTTPException(
             status_code=403,
-            detail=f"Cross-origin scan requests are not allowed (origin={origin})",
+            detail=f"Cross-origin write requests are not allowed (origin={origin})",
         )
 
 

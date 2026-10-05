@@ -6,15 +6,17 @@ from collections.abc import Coroutine
 from datetime import UTC, datetime
 from typing import Any
 
-from core.config import ModelConfig, get_provider_config, get_static_models, provider_enabled
+from core.config import PROVIDERS, ModelConfig, get_provider_config, get_static_models
 from core.database import (
     get_all_health,
     get_last_scan_time,
     init_db,
     log_scan_finish,
     log_scan_start,
+    set_provider_pref,
     upsert_health,
 )
+from core.provider_state import effective_enabled
 from services.health_checker import HealthChecker, ProbeResult
 
 # Guards against cost amplification: each full scan spends real inference requests.
@@ -59,16 +61,15 @@ class SyncService:
                 merged.append(dm)
         return merged
 
-    async def _refresh_discovered_models(self) -> None:
-        """Discover models from dynamic providers."""
+    async def _refresh_discovered_models(self, enabled: dict[str, bool]) -> None:
+        """Discover models from dynamic providers that are currently switched on."""
         if not self._checker:
             return
-        from core.config import PROVIDERS
         discovered: list[ModelConfig] = []
         static_keys = {(m.provider, m.id) for m in get_static_models()}
 
         for provider_key, provider in PROVIDERS.items():
-            if not provider.enabled:
+            if not enabled.get(provider_key, False):
                 continue
             if provider.discovery != "dynamic" or not provider.models_endpoint or not provider.auto_discover:
                 continue
@@ -228,6 +229,8 @@ class SyncService:
         checker = self._checker
         if checker is None:
             return "service_not_initialized"
+        if not (await effective_enabled()).get(provider_key, False):
+            return f"provider_disabled:{provider_key}"
 
         models = [m for m in self._get_all_models() if m.provider == provider_key and m.probe_mode != "none"]
         if not models:
@@ -254,14 +257,16 @@ class SyncService:
         start_time = datetime.now(UTC)
 
         try:
+            enabled = await effective_enabled()
+
             # Discover new models from dynamic providers first
-            await self._refresh_discovered_models()
+            await self._refresh_discovered_models(enabled)
 
             models = self._get_all_models()
             probeable: list[ModelConfig] = []
             skipped: list[ModelConfig] = []
             for m in models:
-                if m.probe_mode == "none" or not provider_enabled(m.provider):
+                if m.probe_mode == "none" or not enabled.get(m.provider, False):
                     skipped.append(m)
                 else:
                     probeable.append(m)
@@ -359,13 +364,55 @@ class SyncService:
             "online": online_count,
         }
 
+    async def set_provider_enabled(self, provider_key: str, enabled: bool) -> None:
+        """Record the switch and refresh the panel when a provider comes back on."""
+        await set_provider_pref(provider_key, enabled)
+        if enabled:
+            # A provider scan is not enough: providers whose catalogue is entirely
+            # discovered have no known models yet, so only a full scan can repopulate
+            # them. The scan slot and its cooldown keep repeated toggles cheap.
+            await self.start_scan()
+
+    async def get_provider_settings(self) -> list[dict[str, Any]]:
+        """Every declared provider with its switch position and catalogue size.
+
+        Unlike the dashboard this lists disabled providers too — it is the screen the
+        user switches them from, so hiding them here would lock them out.
+        """
+        enabled = await effective_enabled()
+        health_rows = await get_all_health()
+        online: dict[str, int] = {}
+        for row in health_rows:
+            if row["status"] == "online":
+                online[row["provider"]] = online.get(row["provider"], 0) + 1
+
+        counts: dict[str, int] = {}
+        for m in self._get_all_models():
+            counts[m.provider] = counts.get(m.provider, 0) + 1
+
+        return [
+            {
+                "key": key,
+                "name": provider.name,
+                "enabled": enabled.get(key, False),
+                "default_enabled": provider.default_enabled,
+                "model_count": counts.get(key, 0),
+                "online_count": online.get(key, 0),
+            }
+            for key, provider in PROVIDERS.items()
+        ]
+
     async def get_dashboard_data(self) -> dict[str, Any]:
         """Combine the model catalog with the latest persisted health data.
 
         Read-only by design: discovery and probing are driven by the scheduler and
         explicit scan requests, never by a dashboard poll.
+
+        Providers switched off in settings are left out entirely — the counts describe
+        what the user is actually monitoring, not the whole catalogue.
         """
-        models = self._get_all_models()
+        enabled = await effective_enabled()
+        models = [m for m in self._get_all_models() if enabled.get(m.provider, False)]
         health_rows = await get_all_health()
         health_map: dict[str, dict[str, Any]] = {
             f"{r['provider']}::{r['model_id']}": r for r in health_rows

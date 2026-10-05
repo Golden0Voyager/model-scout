@@ -35,6 +35,23 @@ class ModelWithHealth(ModelInfo):
     health: HealthStatus = Field(default_factory=lambda: HealthStatus(model_id="", provider=""))
 
 
+class ProviderSetting(BaseModel):
+    key: str
+    name: str
+    enabled: bool
+    default_enabled: bool
+    model_count: int
+    online_count: int
+
+
+class ProviderSettingsResponse(BaseModel):
+    providers: list[ProviderSetting]
+
+
+class ProviderToggleRequest(BaseModel):
+    enabled: bool
+
+
 class ProviderSummary(BaseModel):
     key: str
     name: str
