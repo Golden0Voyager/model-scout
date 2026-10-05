@@ -242,8 +242,9 @@ PROVIDERS: dict[str, ProviderConfig] = {
         rich_discovery=True,
     ),
     # TokenRhythm resells the mainstream Chinese models over one OpenAI-compatible
-    # endpoint. No static rows: the catalogue is whatever its /models serves this
-    # account, so a model the provider adds or drops shows up without a code change.
+    # endpoint. No static rows: /models publishes the account's live catalogue with
+    # context, max output, per-1M CNY prices (base and discounted) and capability
+    # flags, so the monitor follows the upstream instead of a snapshot of a web page.
     "tokenrhythm": ProviderConfig(
         key="tokenrhythm",
         name="TokenRhythm",
@@ -253,6 +254,7 @@ PROVIDERS: dict[str, ProviderConfig] = {
         discovery="dynamic",
         models_endpoint="/models",
         auto_discover=True,
+        rich_discovery=True,
     ),
 }
 

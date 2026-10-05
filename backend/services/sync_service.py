@@ -142,7 +142,8 @@ class SyncService:
                         capabilities=info.get("capabilities", ["chat"]),
                         pricing_input_per_1m=info.get("pricing_input_per_1m"),
                         pricing_output_per_1m=info.get("pricing_output_per_1m"),
-                        pricing_currency="USD",
+                        pricing_currency=info.get("pricing_currency") or "USD",
+                        pricing_note=info.get("pricing_note", ""),
                         is_free=bool(info.get("is_free")),
                         probe_mode="chat",
                     ))

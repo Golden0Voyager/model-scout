@@ -35,15 +35,66 @@ _CAPABILITY_BY_FEATURE = {"tools": "function_calling", "reasoning": "reasoning"}
 def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
     """Derive capability tags from whichever schema this provider publishes."""
     capabilities = ["chat"]
-    if raw.get("supports_image_in") or "image" in (raw.get("input_modalities") or []):
+    if (
+        raw.get("supports_image_in")
+        or raw.get("supports_vision")
+        or "image" in (raw.get("input_modalities") or [])
+    ):
         capabilities.append("vision")
     for feature in raw.get("supported_features") or []:
         mapped = _CAPABILITY_BY_FEATURE.get(feature)
         if mapped and mapped not in capabilities:
             capabilities.append(mapped)
+    for flag, capability in (("supports_tools", "function_calling"), ("supports_reasoning", "reasoning")):
+        if raw.get(flag) and capability not in capabilities:
+            capabilities.append(capability)
     if context_length >= 1_000_000:
         capabilities.append("long_context")
     return capabilities
+
+
+def _pricing_info(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalise a published price into the per-1M amount the catalog stores.
+
+    Two shapes exist. OpenRouter and SenseNova give USD **per token** in a `pricing`
+    object; TokenRhythm gives CNY **per 1M tokens** and keeps base and discounted rates
+    apart. Reading either with the other's multiplier is a million-fold error, so the
+    shape decides how much to scale.
+    """
+    effective_in = raw.get("effective_input_price_per_million")
+    effective_out = raw.get("effective_output_price_per_million")
+    if effective_in is not None and effective_out is not None:
+        try:
+            in_price = float(effective_in)
+            out_price = float(effective_out)
+        except (TypeError, ValueError):
+            return {}
+        info: dict[str, Any] = {
+            # The rate the account actually pays, not the list price it never gets.
+            "pricing_input_per_1m": in_price,
+            "pricing_output_per_1m": out_price,
+            "pricing_currency": raw.get("currency") or "USD",
+            "is_free": in_price == 0.0 and out_price == 0.0,
+        }
+        if raw.get("has_discount"):
+            info["pricing_note"] = "限时折扣"
+        return info
+
+    pricing = raw.get("pricing")
+    if not isinstance(pricing, dict):
+        return {}
+    scale = 1_000_000.0 if "1m" not in str(pricing.get("unit") or "") else 1.0
+    try:
+        prompt_price = float(pricing.get("prompt", 0))
+        completion_price = float(pricing.get("completion", 0))
+    except (TypeError, ValueError):
+        return {}
+    return {
+        "pricing_input_per_1m": prompt_price * scale,
+        "pricing_output_per_1m": completion_price * scale,
+        "pricing_currency": pricing.get("currency") or "USD",
+        "is_free": prompt_price == 0.0 and completion_price == 0.0,
+    }
 
 
 # (model_ids, latency_ms, error_message) — a failed lookup is a value too, so it can
@@ -413,23 +464,13 @@ class HealthChecker:
             context_length = int(m.get("context_length") or 0)
             if context_length:
                 info["context_length"] = context_length
-            if m.get("max_output_length"):
-                info["max_output_tokens"] = int(m["max_output_length"])
+            max_output = m.get("max_output_length") or m.get("max_completion_tokens")
+            if max_output:
+                info["max_output_tokens"] = int(max_output)
             if m.get("description"):
                 info["description"] = m["description"]
             info["capabilities"] = _capabilities(m, context_length)
-            # OpenRouter-shaped pricing, also published by SenseNova. Values are USD
-            # per token, so scale to the per-1M unit the catalog stores.
-            pricing = m.get("pricing")
-            if isinstance(pricing, dict):
-                try:
-                    prompt_price = float(pricing.get("prompt", 0))
-                    completion_price = float(pricing.get("completion", 0))
-                    info["pricing_input_per_1m"] = prompt_price * 1_000_000
-                    info["pricing_output_per_1m"] = completion_price * 1_000_000
-                    info["is_free"] = prompt_price == 0.0 and completion_price == 0.0
-                except (ValueError, TypeError):
-                    pass
+            info.update(_pricing_info(m))
             results.append(info)
         return results, None
 
