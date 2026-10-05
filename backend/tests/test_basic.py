@@ -11,6 +11,7 @@ import re
 import socket
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -34,6 +35,7 @@ from core.config import (
     FALLBACK_CNY_PER_USD,
     PROVIDERS,
     STATIC_MODELS,
+    ModelConfig,
     get_models_for_provider,
     get_provider_config,
     get_static_models,
@@ -41,7 +43,7 @@ from core.config import (
 )
 from core.provider_state import effective_enabled, is_enabled
 from services.fx import SOURCES, FxRate
-from services.health_checker import HealthChecker, ProbeResult
+from services.health_checker import HealthChecker, ProbeResult, is_model_missing
 from services.sync_service import SyncService
 
 _LOOP: asyncio.AbstractEventLoop | None = None
@@ -151,13 +153,18 @@ class Api:
     def put(self, path: str, body: dict[str, Any]) -> httpx.Response:
         return self._call("PUT", path, None, body)
 
+    def delete(self, path: str, headers: dict[str, str] | None = None) -> httpx.Response:
+        return self._call("DELETE", path, headers)
+
 
 def _client(service: SyncService | None) -> Api:
     return Api(service)
 
 
 def _service_with_payload(
-    payload: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    payload: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    status: int = 200,
 ) -> SyncService:
     """A SyncService whose providers all answer /models with the given catalog.
 
@@ -170,7 +177,7 @@ def _service_with_payload(
 
     def handler(request: httpx.Request) -> httpx.Response:
         recorded.append(str(request.url))
-        return httpx.Response(200, json=payload)
+        return httpx.Response(status, json=payload)
 
     transport = httpx.MockTransport(handler)
     service = SyncService()
@@ -481,6 +488,295 @@ def test_dashboard_counts_follow_the_switch() -> None:
 
 def _model_count(provider_key: str) -> int:
     return sum(1 for m in get_static_models() if m.provider == provider_key)
+
+
+# ---------------------------------------------------------------- retired models
+
+GONE = "moonshot::moonshot-v1-8k"
+
+# Collected from the providers this week; each words "this model is gone" its own way,
+# and retirement has to recognise all of them rather than the one phrasing that happened
+# to be coded first.
+MODEL_MISSING_ANSWERS = [
+    "Error code: 422 - {'error': {'message': 'Model Not Exist: DeepSeek-R1-0528'}}",
+    "Error code: 400 - {'error': {'code': '400', 'message': 'Unsupported model mimo-v2-pro'}}",
+    "Error code: 404 - {'error': {'code': 'model_not_found', 'message': 'Unknown model glm-4.7-flash'}}",
+    "The model `moonshot-v1-auto` does not exist or you do not have access to it.",
+    "Model not found at provider",
+]
+
+# Every one of these leaves the model's existence an open question.
+ANSWERS_THAT_ARE_NOT_EVIDENCE = [
+    "Error code: 429 - {'error': {'message': 'Rate limit reached'}}",
+    "Error code: 402 - {'error': {'message': 'Insufficient Balance'}}",
+    "Error code: 401 - {'error': {'message': 'Invalid Authentication'}}",
+    "timed out",
+    "Empty response",
+]
+
+
+@pytest.mark.parametrize("message", MODEL_MISSING_ANSWERS)
+def test_a_gone_model_is_recognised_however_it_is_worded(message: str) -> None:
+    assert is_model_missing(message) is True
+
+
+@pytest.mark.parametrize("message", ANSWERS_THAT_ARE_NOT_EVIDENCE)
+def test_a_transport_or_quota_failure_is_not_a_gone_model(message: str) -> None:
+    assert is_model_missing(message) is False
+
+
+def _stub_probes(service: SyncService, statuses: dict[str, str], asked: list[str]) -> None:
+    """Replace the probe fan-out with verdicts of our choosing, keyed provider::model."""
+    assert service._checker is not None
+
+    async def fake_batch(
+        probes: list[dict[str, str]], concurrency: int = 8
+    ) -> list[ProbeResult]:
+        asked.extend(f"{p['provider']}::{p['model_id']}" for p in probes)
+        return [
+            ProbeResult(
+                model_id=p["model_id"],
+                provider=p["provider"],
+                status=statuses.get(f"{p['provider']}::{p['model_id']}", "online"),
+            )
+            for p in probes
+        ]
+
+    service._checker.probe_batch = fake_batch  # type: ignore[method-assign]
+
+
+def _rescan(service: SyncService) -> dict[str, Any]:
+    """One synchronous scan, cooldown lifted so a test can scan twice in a row."""
+    service._last_scan_started = 0.0
+    result: dict[str, Any] = run(service.run_sync())
+    return result
+
+
+def test_a_rejected_model_that_is_not_listed_is_retired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both signals agree: the provider refuses it and its catalogue omits it."""
+    service = _service_with_payload({"data": []}, monkeypatch)
+    _stub_probes(service, {GONE: "offline"}, [])
+
+    summary = _rescan(service)
+
+    assert service._retired == {("moonshot", "moonshot-v1-8k")}
+    assert summary["retired"] == 1
+    stored = run(database.get_retirements())
+    assert list(stored) == [("moonshot", "moonshot-v1-8k")]
+    assert datetime.fromisoformat(stored[("moonshot", "moonshot-v1-8k")])
+
+
+def test_a_model_still_on_the_catalogue_is_never_retired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An endpoint that rejects a listed model is a broken probe, not a retirement."""
+    listed = {"data": [{"id": "moonshot-v1-8k"}]}
+    service = _service_with_payload(listed, monkeypatch)
+    _stub_probes(service, {GONE: "offline"}, [])
+
+    _rescan(service)
+
+    assert service._retired == set()
+    assert run(database.get_retirements()) == {}
+
+
+def test_a_model_that_answers_although_unlisted_stays(monkeypatch: pytest.MonkeyPatch) -> None:
+    """DeepSeek ships a two-entry /models while still serving deepseek-chat.
+
+    Trusting the catalogue alone would have deleted working models, so a model that
+    answers a real request is kept no matter what the list says.
+    """
+    service = _service_with_payload({"data": []}, monkeypatch)
+    _stub_probes(service, {}, [])
+
+    _rescan(service)
+
+    assert service._retired == set()
+
+
+def test_a_failed_catalogue_lookup_is_no_evidence_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HTTP 500 from /models proves nothing about any model, so nothing may be dropped."""
+    service = _service_with_payload({"data": []}, monkeypatch, status=500)
+    _stub_probes(service, {GONE: "offline"}, [])
+
+    _rescan(service)
+
+    assert service._retired == set()
+
+
+def test_retired_models_leave_the_dashboard_and_stop_costing_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service_with_payload({"data": []}, monkeypatch)
+    asked: list[str] = []
+    _stub_probes(service, {GONE: "offline"}, asked)
+
+    before = _client(service).get("/api/models").json()["total_models"]
+    _rescan(service)
+    asked.clear()
+    _rescan(service)
+
+    assert GONE not in asked, "a retired model must not be probed again"
+    after = _client(service).get("/api/models").json()
+    assert "moonshot-v1-8k" not in {m["id"] for m in after["models"]}
+    assert after["total_models"] == before - 1
+
+
+def test_a_retired_model_comes_back_when_the_catalogue_lists_it_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retirement is a claim about the live list, so it has to survive being wrong."""
+    catalogue: dict[str, Any] = {"data": []}
+    service = _service_with_payload(catalogue, monkeypatch)
+    _stub_probes(service, {GONE: "offline"}, [])
+
+    _rescan(service)
+    assert service._retired == {("moonshot", "moonshot-v1-8k")}
+
+    _stub_probes(service, {}, [])
+    catalogue["data"] = [{"id": "moonshot-v1-8k"}]
+    _rescan(service)
+
+    assert service._retired == set()
+    assert run(database.get_retirements()) == {}
+
+
+def test_retirements_are_listed_and_restorable_through_the_api(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service_with_payload({"data": []}, monkeypatch)
+    _stub_probes(service, {GONE: "offline"}, [])
+    _rescan(service)
+    client = _client(service)
+
+    listed = client.get("/api/retirements").json()["retired"]
+    assert [(r["provider"], r["model_id"]) for r in listed] == [("moonshot", "moonshot-v1-8k")]
+    assert listed[0]["provider_name"] == "Moonshot AI Platform"
+
+    after = client.delete("/api/retirements/moonshot/moonshot-v1-8k").json()["retired"]
+    assert after == []
+    assert service._retired == set()
+    payload = client.get("/api/models").json()
+    assert "moonshot-v1-8k" in {m["id"] for m in payload["models"]}
+
+
+def test_a_slashed_model_id_is_restorable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenRouter-style ids contain slashes, so the path segment has to survive them."""
+    service = _service_with_payload({"data": []}, monkeypatch)
+    service._retired = {("openrouter", "deepseek/deepseek-chat")}
+    run(database.retire_model("openrouter", "deepseek/deepseek-chat"))
+    client = _client(service)
+
+    response = client.delete("/api/retirements/openrouter/deepseek/deepseek-chat")
+    assert response.status_code == 200
+    assert response.json()["retired"] == []
+    assert run(database.get_retirements()) == {}
+
+
+@pytest.mark.parametrize(
+    ("path", "expected"),
+    [("/api/retirements/not-a-provider/kimi", 404), ("/api/retirements/moonshot/gone", 200)],
+)
+def test_restoring_validates_the_provider(
+    monkeypatch: pytest.MonkeyPatch, path: str, expected: int
+) -> None:
+    service = _service_with_payload({"data": []}, monkeypatch)
+    assert _client(service).delete(path).status_code == expected
+
+
+def test_restoring_from_another_origin_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The retirement list is read-only, but restoring writes."""
+    service = _service_with_payload({"data": []}, monkeypatch)
+    _stub_probes(service, {GONE: "offline"}, [])
+    _rescan(service)
+
+    response = _client(service).delete(
+        "/api/retirements/moonshot/moonshot-v1-8k", {"Origin": "http://evil.example"}
+    )
+
+    assert response.status_code == 403
+    assert list(run(database.get_retirements())) == [("moonshot", "moonshot-v1-8k")]
+
+
+def test_a_provider_refresh_applies_the_same_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refreshing one provider judges its own models — and nobody else's."""
+    service = _service_with_payload({"data": []}, monkeypatch)
+    _stub_probes(service, {GONE: "offline"}, [])
+    assert service._checker is not None
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    models = [m for m in service._get_all_models() if m.provider == "moonshot"]
+    before = len(service.recorded_requests)  # type: ignore[attr-defined]
+    summary = run(service._probe_provider_models("moonshot", models, service._checker))
+
+    assert summary["retired"] == 1
+    assert service._retired == {("moonshot", "moonshot-v1-8k")}
+    fresh = service.recorded_requests[before:]  # type: ignore[attr-defined]
+    assert not any("scnet" in u or "deepseek" in u for u in fresh), (
+        "a moonshot refresh went reading other providers"
+    )
+
+
+def test_a_provider_scan_does_not_reprobe_a_retired_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _service_with_payload({"data": []}, monkeypatch)
+    service._retired = {("moonshot", "moonshot-v1-8k")}
+    seen: dict[str, list[str]] = {}
+
+    async def fake_probe(provider_key: str, models: list[ModelConfig], checker: HealthChecker) -> dict[str, Any]:
+        seen["ids"] = [m.id for m in models]
+        return {"status": "success"}
+
+    service._probe_provider_models = fake_probe  # type: ignore[method-assign]
+    verdict = run(service.start_provider_scan("moonshot"))
+
+    assert verdict is None
+    assert "moonshot-v1-8k" not in seen["ids"]
+
+
+def test_a_prefixed_listing_still_protects_a_live_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gemini answers "models/gemini-2.5-pro" while the catalogue row carries the bare id.
+
+    Comparing the raw strings would retire a model that is simply named differently by
+    the two endpoints, so the listing has to be normalised the same way discovery is.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    service = _service_with_payload({"data": [{"id": "models/gemini-2.5-pro"}]}, monkeypatch)
+    _stub_probes(service, {"gemini::gemini-2.5-pro": "offline"}, [])
+
+    _rescan(service)
+
+    assert ("gemini", "gemini-2.5-pro") not in service._retired
+    assert run(database.get_retirements()) == {}
+
+
+def test_provider_settings_count_retired_models_separately(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Hidden is not the same as gone: the panel has to show what it dropped."""
+    service = _service_with_payload({"data": []}, monkeypatch)
+    _stub_probes(service, {GONE: "offline"}, [])
+    _rescan(service)
+
+    moonshot = {p["key"]: p for p in _client(service).get("/api/providers").json()["providers"]}[
+        "moonshot"
+    ]
+    assert moonshot["retired_count"] == 1
+    assert moonshot["model_count"] == _model_count("moonshot") - 1
+
+
+def test_speech_models_are_not_discovered_into_a_chat_panel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MiMo ships -asr and -tts variants; neither is a chat model anyone compares here."""
+    catalogue = {"data": [{"id": "mimo-v2.6-asr"}, {"id": "mimo-v2.6-tts"}, {"id": "mimo-v2.6-pro"}]}
+    monkeypatch.setenv("MIMO_PAYG_API_KEY", "test-key")
+    service = _service_with_payload(catalogue, monkeypatch)
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    found = {m.id for m in service._discovered_models if m.provider == "mimo_payg"}
+    assert found == {"mimo-v2.6-pro"}
 
 
 # ---------------------------------------------------------------- catalogue caching

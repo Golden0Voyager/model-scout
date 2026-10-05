@@ -50,6 +50,24 @@ def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
 # be cached instead of re-fetched once per model.
 ModelsSnapshot = tuple[set | None, int | None, str | None]
 
+# How each provider says "this model is gone". These are terminal answers about the
+# model itself, unlike a timeout, a 429 or an empty balance, which say nothing about
+# whether the model exists and must never be read as a retirement.
+_MODEL_MISSING_MARKERS = (
+    "does not exist",
+    "not exist",
+    "not found",
+    "unsupported model",
+    "model_not_found",
+    "unknown model",
+)
+
+
+def is_model_missing(message: str) -> bool:
+    """True when a provider error means the model itself no longer exists."""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _MODEL_MISSING_MARKERS)
+
 
 class HealthChecker:
     def __init__(self, proxy: str | None = None):
@@ -122,6 +140,20 @@ class HealthChecker:
     def reset_model_cache(self) -> None:
         """Drop every cached catalogue so the next scan sees one coherent snapshot."""
         self._models_cache.clear()
+
+    def listed_ids(self, provider_key: str) -> set[str] | None:
+        """The catalogue this provider last returned, or None when that lookup failed.
+
+        Retirement reads this. An id missing from a lookup that never succeeded is not
+        evidence of anything, so a failed snapshot has to stay invisible to the caller.
+        """
+        cached = self._models_cache.get(provider_key)
+        if cached is None:
+            return None
+        fetched_at, snapshot = cached
+        if int(time.time() * 1000) - fetched_at >= self._cache_ttl_ms:
+            return None
+        return snapshot[0]
 
     async def _fetch_provider_models(self, provider: ProviderConfig) -> ModelsSnapshot:
         """Fetch the provider's model list: cached, and shared by concurrent callers.
@@ -295,7 +327,7 @@ class HealthChecker:
             )
         except Exception as e:
             msg = str(e)
-            if "does not exist" in msg or "not found" in msg.lower():
+            if is_model_missing(msg):
                 return ProbeResult(
                     model_id=model_id,
                     provider=provider.key,
