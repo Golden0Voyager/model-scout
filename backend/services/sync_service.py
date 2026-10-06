@@ -85,51 +85,29 @@ class SyncService:
             if provider.discovery != "dynamic" or not provider.models_endpoint or not provider.auto_discover:
                 continue
 
-            # OpenRouter: detailed discovery, keep free models only
-            if provider_key == "openrouter":
-                models_info, error = await self._checker.discover_models_detailed(provider_key)
-                if models_info is None:
-                    if error:
-                        print(f"⚠️ Discovery failed for {provider.name}: {error}")
-                    continue
-                self._listed[provider_key] = {
-                    str(info["id"]) for info in models_info if info.get("id")
-                }
-                free_models = [m for m in models_info if m.get("is_free")]
-                for info in free_models:
-                    mid = info["id"]
-                    if (provider_key, mid) in static_keys:
-                        continue
-                    discovered.append(ModelConfig(
-                        id=mid,
-                        name=info.get("name", mid),
-                        provider=provider_key,
-                        context_length=0,
-                        description=f"Auto-discovered from {provider.name}",
-                        description_cn=f"从 {provider.name} 自动发现",
-                        capabilities=["chat"],
-                        pricing_input_per_1m=info.get("pricing_input_per_1m"),
-                        pricing_output_per_1m=info.get("pricing_output_per_1m"),
-                        pricing_currency="USD",
-                        is_free=True,
-                        probe_mode="chat",
-                    ))
-                print(f"🔎 {provider.name}: discovered {len(free_models)} free models")
-                continue
-
-            # Providers whose /models carries per-model metadata (Moonshot, SenseNova).
+            # Providers whose /models carries per-model metadata (Moonshot, SenseNova,
+            # OpenRouter, ZenMux).
             if provider.rich_discovery:
                 models_info, error = await self._checker.discover_models_detailed(provider_key)
                 if models_info is None:
                     if error:
                         print(f"⚠️ Discovery failed for {provider.name}: {error}")
                     continue
+                # Record everything the upstream lists, including rows this panel
+                # chooses not to monitor: retirement reads this as evidence of what
+                # still exists, and "we do not watch paid tiers" is not "it is gone".
                 self._listed[provider_key] = {
                     str(info["id"]) for info in models_info if info.get("id")
                 }
+                kept = 0
                 for info in models_info:
                     mid = info["id"]
                     if (provider_key, mid) in static_keys:
+                        continue
+                    outputs = info.get("output_modalities") or []
+                    if outputs and "text" not in outputs:
+                        continue
+                    if provider.free_only and not info.get("is_free"):
                         continue
                     discovered.append(ModelConfig(
                         id=mid,
@@ -147,7 +125,9 @@ class SyncService:
                         is_free=bool(info.get("is_free")),
                         probe_mode="chat",
                     ))
-                print(f"🔎 {provider.name}: discovered {len(models_info)} models with metadata")
+                    kept += 1
+                watched = " free" if provider.free_only else ""
+                print(f"🔎 {provider.name}: discovered {kept}{watched} models with metadata")
                 continue
 
             # Other providers: standard ID-only discovery
