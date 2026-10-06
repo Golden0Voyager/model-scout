@@ -39,8 +39,10 @@ npm run dev
 - **`core/models.py`**：Pydantic 响应模型
 - **`core/database.py`**：aiosqlite 异步数据库操作，存储健康状态历史、provider 开关与退役记录
 - **`core/provider_state.py`**：运行时开关的唯一读取入口。`effective_enabled()` 把库里的用户选择叠加在 config 默认之上；库里没有记录的 provider 走默认值
-- **`services/health_checker.py`**：健康探测引擎。支持 models_endpoint 探测（免费）和 chat_ping（最小 token 成本），目录缓存 120 秒且失败也缓存。`is_model_missing()` 把各家写法不同的「这个模型没了」归成一类；`listed_ids()` 给出本轮真正拉到的目录（拉取失败返回 None，不能当证据）
-- **两种定价外形**：`_pricing_info()` 按发布格式换算，别再用统一乘数。OpenRouter / SenseNova 的 `pricing.prompt` 是 **USD 每 token**（乘 1e6）；TokenRhythm 带 `unit: "per_1m_tokens"`，给的已经是 **CNY 每 1M**（不乘），且 `pricing` 是原价、`effective_input/output_price_per_million` 才是账号实付价，面板显示后者、`has_discount` 时标「限时折扣」。用错乘数就是一百万倍的误差
+- **`services/health_checker.py`**：健康探测引擎。支持 models_endpoint 探测（免费）和 chat_ping（最小 token 成本），目录缓存 120 秒且失败也缓存。`is_model_missing()` 把各家写法不同的「这个模型没了」归成一类；`listed_ids()` 给出本轮真正拉到的目录（拉取失败返回 None，不能当证据）；显示名依次取 `name` → `display_name` → id（ZenMux 只有 `display_name`）
+- **两种定价外形**：`_pricing_info()` 按发布格式换算，别再用统一乘数。OpenRouter / SenseNova 的 `pricing.prompt` 是 **USD 每 token**（乘 1e6）；TokenRhythm 带 `unit: "per_1m_tokens"`，给的已经是 **CNY 每 1M**（不乘），且 `pricing` 是原价、`effective_input/output_price_per_million` 才是账号实付价，面板显示后者、`has_discount` 时标「限时折扣」；ZenMux 用 `pricings.prompt[]` **分层价格列表**，取第一档（入口价），单位不是 `perMTokens` 就不解析。用错乘数就是一百万倍的误差
+- **只监控免费档由 config 决定**：`free_only=True`（OpenRouter、ZenMux）在富元数据分支里过滤掉付费行，**不许再写 `if provider_key == "openrouter"`**——那条命名分支已经删掉，有测试守着。免费判断依赖价格元数据，所以 `free_only` 必须和 `rich_discovery` 同时开（也有测试断言）。`_listed` 记录上游列出的**全部** id，包含没监控的付费与图像行，否则退役判定会把「我们不监控」误读成「上游已经下架」
+- **按输出模态过滤**：聚合器会列出图像 / 视频 / TTS / embedding 模型。声明了 `output_modalities` 且不含 `text` 的行直接跳过（比关键字黑名单可靠），这也是 ZenMux 8 个免费模型里 3 个图像生成器不进面板的原因
 - **`services/sync_service.py`**：同步调度服务。`acquire_scan()` 提供原子扫描槽位，`MIN_SCAN_INTERVAL_SECONDS` 提供冷却，探测为 6 并发 + 150ms 间隔；`_apply_retirements()` 在每轮扫描末尾裁决退役与复活
 - **`core/access.py`**：扫描接口的访问控制。`ALLOWED_ORIGINS` 校验请求来源，`probe_limiter` 为单模型探测提供滑动窗口限流
 - **`services/fx.py`**：`FxRate` 保存 USD/CNY 参考汇率。由后台任务按 `FX_REFRESH_SECONDS` 刷新，取不到时保留上一次好值、最终回退到 `FALLBACK_CNY_PER_USD`

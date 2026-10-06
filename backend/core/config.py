@@ -55,6 +55,10 @@ class ProviderConfig:
     # /models returns per-model metadata (context, modalities, features, pricing)
     # rather than bare IDs
     rich_discovery: bool = False
+    # Monitor only the models that cost nothing. Both aggregators that need this list
+    # hundreds of paid rows, and probing one of those every scan spends real money.
+    # Needs rich_discovery: "is free" cannot be decided from a bare model ID.
+    free_only: bool = False
     # Auth style: "bearer" (default, Authorization: Bearer <key>) or "api_key" (api-key: <key>)
     auth_style: str = "bearer"
 
@@ -91,6 +95,8 @@ PROVIDERS: dict[str, ProviderConfig] = {
         discovery="dynamic",
         models_endpoint="/models",
         auto_discover=True,
+        rich_discovery=True,
+        free_only=True,
     ),
     "groq": ProviderConfig(
         key="groq",
@@ -255,6 +261,22 @@ PROVIDERS: dict[str, ProviderConfig] = {
         models_endpoint="/models",
         auto_discover=True,
         rich_discovery=True,
+    ),
+    # ZenMux aggregates 200+ models behind an unusual base path (/api/v1, not /v1) and
+    # publishes its catalogue without a key. Only the free tier is monitored: the paid
+    # rows would swamp the panel and each one costs a real request to probe.
+    # Measured: the host is unreachable without the overseas proxy.
+    "zenmux": ProviderConfig(
+        key="zenmux",
+        name="ZenMux",
+        base_url="https://zenmux.ai/api/v1",
+        api_key_env="ZENMUX_API_KEY",
+        network="proxy",
+        discovery="dynamic",
+        models_endpoint="/models",
+        auto_discover=True,
+        rich_discovery=True,
+        free_only=True,
     ),
 }
 

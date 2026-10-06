@@ -31,6 +31,13 @@ class ProbeResult:
 # else would render as a raw snake_case tag.
 _CAPABILITY_BY_FEATURE = {"tools": "function_calling", "reasoning": "reasoning"}
 
+# ZenMux publishes capabilities as flags rather than a feature list.
+_CAPABILITY_BY_FLAG = {
+    "reasoning": "reasoning",
+    "tools": "function_calling",
+    "function_calling": "function_calling",
+}
+
 
 def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
     """Derive capability tags from whichever schema this provider publishes."""
@@ -45,6 +52,9 @@ def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
         mapped = _CAPABILITY_BY_FEATURE.get(feature)
         if mapped and mapped not in capabilities:
             capabilities.append(mapped)
+    for flag, capability in _CAPABILITY_BY_FLAG.items():
+        if (raw.get("capabilities") or {}).get(flag) and capability not in capabilities:
+            capabilities.append(capability)
     for flag, capability in (("supports_tools", "function_calling"), ("supports_reasoning", "reasoning")):
         if raw.get(flag) and capability not in capabilities:
             capabilities.append(capability)
@@ -53,13 +63,22 @@ def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
     return capabilities
 
 
+def _base_tier(tiers: Any) -> dict[str, Any] | None:
+    """The entry price of a tiered price list, ignoring volume break points."""
+    if not isinstance(tiers, list) or not tiers:
+        return None
+    first = tiers[0]
+    return first if isinstance(first, dict) else None
+
+
 def _pricing_info(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalise a published price into the per-1M amount the catalog stores.
 
-    Two shapes exist. OpenRouter and SenseNova give USD **per token** in a `pricing`
-    object; TokenRhythm gives CNY **per 1M tokens** and keeps base and discounted rates
-    apart. Reading either with the other's multiplier is a million-fold error, so the
-    shape decides how much to scale.
+    Three shapes exist in the wild. OpenRouter and SenseNova give USD **per token** in
+    a `pricing` object; TokenRhythm gives CNY **per 1M tokens** and keeps base and
+    discounted rates apart; ZenMux gives USD **per 1M tokens** as a list of tiers.
+    Reading any of them with another's multiplier is a million-fold error, so each
+    branch states its own unit instead of the code assuming one.
     """
     effective_in = raw.get("effective_input_price_per_million")
     effective_out = raw.get("effective_output_price_per_million")
@@ -79,6 +98,24 @@ def _pricing_info(raw: dict[str, Any]) -> dict[str, Any]:
         if raw.get("has_discount"):
             info["pricing_note"] = "限时折扣"
         return info
+
+    tiers = raw.get("pricings")
+    if isinstance(tiers, dict):
+        prompt = _base_tier(tiers.get("prompt"))
+        completion = _base_tier(tiers.get("completion"))
+        if not prompt or not completion or prompt.get("unit") != "perMTokens":
+            return {}
+        try:
+            in_price = float(prompt["value"])
+            out_price = float(completion["value"])
+        except (KeyError, TypeError, ValueError):
+            return {}
+        return {
+            "pricing_input_per_1m": in_price,
+            "pricing_output_per_1m": out_price,
+            "pricing_currency": prompt.get("currency") or "USD",
+            "is_free": in_price == 0.0 and out_price == 0.0,
+        }
 
     pricing = raw.get("pricing")
     if not isinstance(pricing, dict):
@@ -459,7 +496,7 @@ class HealthChecker:
                 continue
             info: dict[str, Any] = {
                 "id": mid,
-                "name": m.get("name") or mid,
+                "name": m.get("name") or m.get("display_name") or mid,
             }
             context_length = int(m.get("context_length") or 0)
             if context_length:
@@ -470,6 +507,9 @@ class HealthChecker:
             if m.get("description"):
                 info["description"] = m["description"]
             info["capabilities"] = _capabilities(m, context_length)
+            # Aggregators list image, video, TTS and embedding models beside the chat
+            # ones. The sync layer needs the declared outputs to tell them apart.
+            info["output_modalities"] = [str(v) for v in (m.get("output_modalities") or [])]
             info.update(_pricing_info(m))
             results.append(info)
         return results, None

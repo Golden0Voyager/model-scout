@@ -266,9 +266,20 @@ def test_rich_discovery_drives_metadata_not_provider_names() -> None:
 
     source = inspect.getsource(module.SyncService._refresh_discovered_models)
     assert 'provider_key == "moonshot"' not in source
-    for key in ("moonshot", "sensenova"):
+    # OpenRouter used to be a name branch with its own row builder; the free_only flag
+    # replaced it, so nothing may reintroduce a per-provider condition here.
+    assert 'provider_key == "openrouter"' not in source
+    assert "free_only" in source
+    for key in ("moonshot", "sensenova", "tokenrhythm", "openrouter", "zenmux"):
         provider = PROVIDERS[key]
         assert provider.rich_discovery is True
+
+
+def test_free_only_needs_the_rich_path() -> None:
+    """A bare model ID cannot tell free from paid, so the flag would silently no-op."""
+    for key, provider in PROVIDERS.items():
+        if provider.free_only:
+            assert provider.rich_discovery is True, key
 
 
 # ---------------------------------------------------------------- discovery mapping
@@ -376,6 +387,23 @@ TOKENRHYTHM_CATALOG: dict[str, Any] = {
 }
 
 
+def test_zenmux_is_reachable_only_through_the_proxy() -> None:
+    """Measured: the host refuses a direct connection from this machine.
+
+    Its catalogue endpoint is public, so discovery works before any key exists, but
+    chat probes need ZENMUX_API_KEY. The base path carries an unusual /api prefix.
+    """
+    provider = get_provider_config("zenmux")
+    assert provider is not None
+    assert provider.base_url == "https://zenmux.ai/api/v1"
+    assert provider.models_endpoint == "/models"
+    assert provider.api_key_env == "ZENMUX_API_KEY"
+    assert provider.network == "proxy"
+    assert provider.auth_style == "bearer"
+    assert provider.free_only is True
+    assert [m.id for m in get_models_for_provider("zenmux")] == []
+
+
 def test_per_million_prices_are_not_rescaled(monkeypatch: pytest.MonkeyPatch) -> None:
     """OpenRouter gives USD per token, TokenRhythm gives CNY per 1M tokens.
 
@@ -419,6 +447,128 @@ def test_per_token_publishers_keep_the_old_shape(monkeypatch: pytest.MonkeyPatch
     assert pro.pricing_input_per_1m == 20_000.0
     assert pro.pricing_currency == "USD"
     assert pro.pricing_note == ""
+
+
+# Transcribed from the live https://zenmux.ai/api/v1/models on 2026-10-06 (201 models).
+# ZenMux prices in USD per 1M tokens and splits each price into volume tiers; it also
+# lists image, video, TTS and embedding models beside the chat ones.
+ZENMUX_CATALOG: dict[str, Any] = {
+    "data": [
+        {
+            "id": "z-ai/glm-4.7-flash-free",
+            "display_name": "Z.AI: GLM 4.7 Flash (Free)",
+            "owned_by": "z-ai",
+            "input_modalities": ["text"],
+            "output_modalities": ["text"],
+            "capabilities": {"reasoning": True},
+            "context_length": 200000,
+            "pricings": {
+                "prompt": [{"value": 0, "unit": "perMTokens", "currency": "USD"}],
+                "completion": [{"value": 0, "unit": "perMTokens", "currency": "USD"}],
+            },
+        },
+        {
+            "id": "inclusionai/ming-image-0.1-design",
+            "display_name": "inclusionAI: Ming Image 0.1 Design",
+            "owned_by": "inclusionai",
+            "input_modalities": ["text"],
+            "output_modalities": ["image"],
+            "capabilities": {"reasoning": False},
+            "context_length": 8000,
+            "pricings": {
+                "prompt": [{"value": 0, "unit": "perMTokens", "currency": "USD"}],
+                "completion": [{"value": 0, "unit": "perMTokens", "currency": "USD"}],
+            },
+        },
+        {
+            "id": "openai/gpt-6.1-sol",
+            "display_name": "OpenAI: GPT-6.1 Sol",
+            "owned_by": "openai",
+            "input_modalities": ["text", "image", "file"],
+            "output_modalities": ["text"],
+            "capabilities": {"reasoning": True},
+            "context_length": 1050000,
+            "pricings": {
+                "prompt": [
+                    {"value": 2, "unit": "perMTokens", "currency": "USD"},
+                    {"value": 4, "unit": "perMTokens", "currency": "USD"},
+                ],
+                "completion": [
+                    {"value": 10, "unit": "perMTokens", "currency": "USD"},
+                    {"value": 15, "unit": "perMTokens", "currency": "USD"},
+                ],
+            },
+        },
+    ]
+}
+
+
+def _zenmux_metadata(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    monkeypatch.setenv("ZENMUX_API_KEY", "test-key")
+    checker, _ = _counting_checker(monkeypatch, payload=ZENMUX_CATALOG)
+    models, error = run(checker.discover_models_detailed("zenmux"))
+    assert error is None
+    assert models is not None
+    return models
+
+
+def test_zenmux_metadata_is_parsed_from_its_own_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ZenMux publishes several tiers per model; the entry tier is the quoted price."""
+    by_id = {m["id"]: m for m in _zenmux_metadata(monkeypatch)}
+
+    paid = by_id["openai/gpt-6.1-sol"]
+    assert paid["pricing_input_per_1m"] == 2.0
+    assert paid["pricing_output_per_1m"] == 10.0
+    assert paid["pricing_currency"] == "USD"
+    assert paid["is_free"] is False
+    assert "reasoning" in paid["capabilities"]
+    assert "vision" in paid["capabilities"]
+    assert "long_context" in paid["capabilities"]
+
+    free = by_id["z-ai/glm-4.7-flash-free"]
+    assert free["is_free"] is True
+    assert free["name"] == "Z.AI: GLM 4.7 Flash (Free)"
+
+
+def test_free_only_and_non_chat_outputs_are_filtered_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    """8 of ZenMux's 201 rows are free; three of those generate images, not text."""
+    monkeypatch.setenv("ZENMUX_API_KEY", "test-key")
+    service = _service_with_payload(ZENMUX_CATALOG, monkeypatch)
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    found = {m.id for m in service._discovered_models if m.provider == "zenmux"}
+    assert found == {"z-ai/glm-4.7-flash-free"}
+    # Retirement reads the listing, not the watched subset: everything the upstream
+    # still serves has to count as present, paid and image rows included.
+    assert service._listed["zenmux"] == {
+        "z-ai/glm-4.7-flash-free",
+        "inclusionai/ming-image-0.1-design",
+        "openai/gpt-6.1-sol",
+    }
+
+
+def test_free_providers_no_longer_lose_their_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenRouter rows used to be built with context 0 by a name-specific branch."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    catalog = {
+        "data": [
+            {
+                "id": "free/thing",
+                "name": "Free Thing",
+                "context_length": 512000,
+                "input_modalities": ["text", "image"],
+                "pricing": {"prompt": "0", "completion": "0"},
+            }
+        ]
+    }
+    service = _service_with_payload(catalog, monkeypatch)
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    row = next(m for m in service._discovered_models if m.provider == "openrouter")
+    assert row.context_length == 512000
+    assert row.name == "Free Thing"
+    assert "vision" in row.capabilities
+    assert row.is_free is True
 
 
 # ---------------------------------------------------------------- provider switch

@@ -126,6 +126,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   anyrouter: "#8b5cf6",
   agentrouter: "#06b6d4",
   tokenrhythm: "#f43f5e",
+  zenmux: "#14b8a6",
 };
 
 const TAB_CONFIG: { key: TabFilter; label: string; icon: React.ReactNode }[] = [
