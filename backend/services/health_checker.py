@@ -137,6 +137,31 @@ def _pricing_info(raw: dict[str, Any]) -> dict[str, Any]:
 # (model_ids, latency_ms, error_message) — a failed lookup is a value too, so it can
 # be cached instead of re-fetched once per model.
 ModelsSnapshot = tuple[set | None, int | None, str | None]
+# The same snapshot before the ids are projected out of it. Rows are the superset: the
+# discovery path needs their metadata and the probe path only needs membership, so both
+# share one cached document.
+RowsSnapshot = tuple[list | None, int | None, str | None]
+
+
+def _model_ids(rows: list[Any]) -> set[str]:
+    """Model ids as the provider spells them, from whichever field carries the name."""
+    return {
+        str(value)
+        for value in (
+            row.get("id") or row.get("name") for row in rows if isinstance(row, dict)
+        )
+        if value
+    }
+
+
+def _describe_error(error: Exception) -> str:
+    """A failure reason that is never blank.
+
+    Some transport errors — a connect timeout among them — stringify to "", and one layer
+    up an empty string reads as "no error", so a timed-out catalogue reported "returned no
+    data" instead of naming what actually happened.
+    """
+    return (str(error).strip() or type(error).__name__)[:120]
 
 # How each provider says "this model is gone". These are terminal answers about the
 # model itself, unlike a timeout, a 429 or an empty balance, which say nothing about
@@ -170,10 +195,10 @@ class HealthChecker:
             timeout=15.0, follow_redirects=True, trust_env=False
         )
         self._openai_clients: dict[str, AsyncOpenAI] = {}
-        # provider_key -> (fetched_at_ms, snapshot)
-        self._models_cache: dict[str, tuple[int, ModelsSnapshot]] = {}
-        # provider_key -> the fetch every concurrent probe should join
-        self._models_inflight: dict[str, asyncio.Task[ModelsSnapshot]] = {}
+        # provider_key -> (fetched_at_ms, snapshot of the raw catalogue rows)
+        self._models_cache: dict[str, tuple[int, RowsSnapshot]] = {}
+        # provider_key -> the fetch every concurrent caller should join
+        self._models_inflight: dict[str, asyncio.Task[RowsSnapshot]] = {}
         # Must outlast a full scan (measured ~40s over ~490 models); a shorter TTL
         # expired mid-scan and made every later model re-fetch. Scans also reset the
         # cache explicitly, so this bound only governs ad-hoc single-model probes.
@@ -241,15 +266,19 @@ class HealthChecker:
         fetched_at, snapshot = cached
         if int(time.time() * 1000) - fetched_at >= self._cache_ttl_ms:
             return None
-        return snapshot[0]
+        rows = snapshot[0]
+        return None if rows is None else _model_ids(rows)
 
-    async def _fetch_provider_models(self, provider: ProviderConfig) -> ModelsSnapshot:
-        """Fetch the provider's model list: cached, and shared by concurrent callers.
+    async def _provider_rows(self, provider: ProviderConfig) -> RowsSnapshot:
+        """The provider's catalogue rows: cached, and shared by concurrent callers.
 
-        A single scan probes hundreds of models from the same provider, so failures are
-        cached as readily as successes — otherwise a broken /models was re-requested
-        once per model — and concurrent callers join one in-flight request rather than
-        each issuing their own.
+        One scan wants this document twice per provider — once to discover models, once
+        to probe them — so it is fetched once. Asking a 150 KB catalogue twice, while
+        six probes are already queued on the proxy, is how every ZenMux row ended up
+        timing out and then reporting nothing at all.
+
+        Failures are cached as readily as successes; otherwise a broken /models was
+        re-requested once per model, and concurrent callers join one in-flight request.
         """
         cached = self._models_cache.get(provider.key)
         if cached is not None:
@@ -261,17 +290,17 @@ class HealthChecker:
         if inflight is not None:
             return await asyncio.shield(inflight)
 
-        task = asyncio.create_task(self._load_provider_models(provider))
+        task = asyncio.create_task(self._load_provider_rows(provider))
         self._models_inflight[provider.key] = task
         try:
             return await asyncio.shield(task)
         finally:
             self._models_inflight.pop(provider.key, None)
 
-    async def _load_provider_models(self, provider: ProviderConfig) -> ModelsSnapshot:
+    async def _load_provider_rows(self, provider: ProviderConfig) -> RowsSnapshot:
         api_key = self._api_key(provider)
         if api_key is None:
-            snapshot: ModelsSnapshot = (None, None, f"no API key ({provider.api_key_env})")
+            snapshot: RowsSnapshot = (None, None, f"no API key ({provider.api_key_env})")
         else:
             client = self._get_http_client(provider)
             url = f"{provider.base_url}{provider.models_endpoint}"
@@ -281,18 +310,21 @@ class HealthChecker:
                 response = await client.get(url, headers=headers)
                 latency_ms = int((time.perf_counter() - start) * 1000)
                 if response.status_code == 200:
-                    models = response.json().get("data", [])
-                    model_ids = {
-                        m.get("id") or m.get("name") for m in models if m.get("id") or m.get("name")
-                    }
-                    snapshot = (model_ids, latency_ms, None)
+                    snapshot = (response.json().get("data", []), latency_ms, None)
                 else:
                     snapshot = (None, latency_ms, f"HTTP {response.status_code}")
             except Exception as e:
-                snapshot = (None, None, str(e)[:120])
+                snapshot = (None, None, _describe_error(e))
 
         self._models_cache[provider.key] = (int(time.time() * 1000), snapshot)
         return snapshot
+
+    async def _fetch_provider_models(self, provider: ProviderConfig) -> ModelsSnapshot:
+        """The provider's model ids, read from the same document the discovery step used."""
+        rows, latency_ms, error = await self._provider_rows(provider)
+        if rows is None:
+            return None, latency_ms, error
+        return _model_ids(rows), latency_ms, error
 
     async def probe(self, model_id: str, provider_key: str) -> ProbeResult:
         """Run a lightweight probe for a single model."""
@@ -443,25 +475,6 @@ class HealthChecker:
                 error_message=msg[:120],
             )
 
-    async def _fetch_provider_models_raw(self, provider: ProviderConfig) -> tuple[list[dict[str, Any]] | None, str | None]:
-        """Fetch the provider's raw model list (with metadata). No caching."""
-        api_key = self._api_key(provider)
-        if api_key is None:
-            return None, f"no API key ({provider.api_key_env})"
-
-        client = self._get_http_client(provider)
-        url = f"{provider.base_url}{provider.models_endpoint}"
-        headers = self._get_auth_headers(provider, api_key)
-        try:
-            response = await client.get(url, headers=headers)
-            if response.status_code == 200:
-                data = response.json()
-                models = data.get("data", [])
-                return models, None
-            return None, f"HTTP {response.status_code}"
-        except Exception as e:
-            return None, str(e)[:120]
-
     async def discover_models(self, provider_key: str) -> tuple[list[str] | None, str | None]:
         """Discover available model IDs from a dynamic provider."""
         provider = get_provider_config(provider_key)
@@ -485,12 +498,14 @@ class HealthChecker:
         if provider.discovery != "dynamic" or not provider.models_endpoint:
             return None, "Provider does not support dynamic discovery"
 
-        models, error = await self._fetch_provider_models_raw(provider)
-        if models is None:
+        rows, _latency_ms, error = await self._provider_rows(provider)
+        if rows is None:
             return None, error
 
         results: list[dict[str, Any]] = []
-        for m in models:
+        for m in rows:
+            if not isinstance(m, dict):
+                continue
             mid = m.get("id") or m.get("name")
             if not mid:
                 continue

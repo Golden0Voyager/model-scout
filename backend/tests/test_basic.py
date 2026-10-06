@@ -1105,6 +1105,53 @@ def test_a_scan_fetches_a_provider_catalogue_once(monkeypatch: pytest.MonkeyPatc
     assert all(r.status == "online" for r in results)
 
 
+def test_a_rich_scan_reads_the_catalogue_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Discovery and probing want the same document, so one scan asks for it once.
+
+    Rich providers fetched it twice — discovery uncached, probing through the cache —
+    and ZenMux's 150 KB list timed out on that second request while six probes were
+    already queued on the proxy. All six of its free models then reported as having no
+    data, while a single probe on an idle client came back online.
+    """
+    monkeypatch.setenv("MOONSHOT_API_KEY", "test-key")
+    catalogue = {"data": [{"id": f"m{i}", "context_length": 200000} for i in range(12)]}
+    checker, urls = _counting_checker(monkeypatch, payload=catalogue)
+
+    async def scenario() -> tuple[list[dict[str, Any]], list[ProbeResult]]:
+        models, error = await checker.discover_models_detailed("moonshot")
+        assert error is None
+        probed = await checker.probe_batch(
+            [{"model_id": f"m{i}", "provider": "moonshot"} for i in range(12)], concurrency=6
+        )
+        return models or [], probed
+
+    discovered, probed = run(scenario())
+
+    assert len(discovered) == 12
+    assert all(r.status == "online" for r in probed)
+    assert [u for u in urls if u.endswith("/models")] == [urls[0]], urls
+
+
+def test_a_transport_failure_always_names_itself(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Some timeouts stringify to "", and an empty reason reads as "no error" upstream."""
+    provider = PROVIDERS["openrouter"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise TimeoutError("")
+
+    checker = HealthChecker()
+    transport = httpx.MockTransport(handler)
+    checker._proxy_client = httpx.AsyncClient(transport=transport)
+    checker._direct_client = httpx.AsyncClient(transport=transport)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    rows, latency, error = run(checker._provider_rows(provider))
+
+    assert rows is None
+    assert error == "TimeoutError", error
+    assert error  # never blank: this is what turns into the panel's error message
+
+
 def test_concurrent_lookups_join_one_inflight_request(monkeypatch: pytest.MonkeyPatch) -> None:
     checker, urls = _counting_checker(monkeypatch, delay=0.05)
     provider = PROVIDERS["openrouter"]

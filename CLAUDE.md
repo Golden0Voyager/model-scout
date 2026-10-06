@@ -39,7 +39,7 @@ npm run dev
 - **`core/models.py`**：Pydantic 响应模型
 - **`core/database.py`**：aiosqlite 异步数据库操作，存储健康状态历史、provider 开关与退役记录
 - **`core/provider_state.py`**：运行时开关的唯一读取入口。`effective_enabled()` 把库里的用户选择叠加在 config 默认之上；库里没有记录的 provider 走默认值
-- **`services/health_checker.py`**：健康探测引擎。支持 models_endpoint 探测（免费）和 chat_ping（最小 token 成本），目录缓存 120 秒且失败也缓存。`is_model_missing()` 把各家写法不同的「这个模型没了」归成一类；`listed_ids()` 给出本轮真正拉到的目录（拉取失败返回 None，不能当证据）；显示名依次取 `name` → `display_name` → id（ZenMux 只有 `display_name`）
+- **`services/health_checker.py`**：健康探测引擎。支持 models_endpoint 探测（免费）和 chat_ping（最小 token 成本），目录缓存 120 秒且失败也缓存。`is_model_missing()` 把各家写法不同的「这个模型没了」归成一类；`listed_ids()` 给出本轮真正拉到的目录（拉取失败返回 None，不能当证据）；显示名依次取 `name` → `display_name` → id（ZenMux 只有 `display_name`）；`_describe_error()` 保证失败原因永不为空——有些超时 `str(e)` 就是空串，而空串在上一层会被当成"没有错误"
 - **两种定价外形**：`_pricing_info()` 按发布格式换算，别再用统一乘数。OpenRouter / SenseNova 的 `pricing.prompt` 是 **USD 每 token**（乘 1e6）；TokenRhythm 带 `unit: "per_1m_tokens"`，给的已经是 **CNY 每 1M**（不乘），且 `pricing` 是原价、`effective_input/output_price_per_million` 才是账号实付价，面板显示后者、`has_discount` 时标「限时折扣」；ZenMux 用 `pricings.prompt[]` **分层价格列表**，取第一档（入口价），单位不是 `perMTokens` 就不解析。用错乘数就是一百万倍的误差
 - **只监控免费档由 config 决定**：`free_only=True`（OpenRouter、ZenMux）在富元数据分支里过滤掉付费行，**不许再写 `if provider_key == "openrouter"`**——那条命名分支已经删掉，有测试守着。免费判断依赖价格元数据，所以 `free_only` 必须和 `rich_discovery` 同时开（也有测试断言）。`_listed` 记录上游列出的**全部** id，包含没监控的付费与图像行，否则退役判定会把「我们不监控」误读成「上游已经下架」
 - **按输出模态过滤**：聚合器会列出图像 / 视频 / TTS / embedding 模型。声明了 `output_modalities` 且不含 `text` 的行直接跳过（比关键字黑名单可靠），这也是 ZenMux 8 个免费模型里 3 个图像生成器不进面板的原因
@@ -98,7 +98,7 @@ cd frontend && npm run lint && npx tsc --noEmit
 - **写接口来源校验**：三个 `POST /api/scan*` 与 `PUT /api/providers/{key}` 走 `require_trusted_origin`（`GET /api/providers` 不设守卫，它不写任何东西）。浏览器对跨源写请求一定附带 `Origin`，因此不在白名单（含 `Origin: null`）即 403，无需向前端分发密钥。Next 的 rewrites 是服务端代理且会透传 `Origin`，所以前端链路同样受保护、也照常放行（已实测）。**不带 `Origin` 视为本地请求**：curl 和本地脚本本来就能读到 `.env` 里的全部密钥，给它们加令牌保护不了任何东西。若将来把服务绑到非回环地址，这套就不够了，需要真正的鉴权
 - **面板换端口时**：`ALLOWED_ORIGINS` 与 CORS 共用同一份常量，改端口要更新 `core/access.py`；前端目标地址由 `MODELSCOUT_BACKEND_URL` 给出，不必再改 `next.config.ts`
 - **单模型探测限流**：`POST /api/scan/{provider}/{model}` 每次都是一笔真实请求且不受扫描冷却约束，故独立限流为 30 次/60 秒，超限返回 429 并带 `Retry-After`
-- **模型缓存**：同一供应商的 models 列表在 30s TTL 内只请求一次，缓存在 `HealthChecker._models_cache`
+- **模型目录每轮只抓一次**：`_provider_rows()` 是唯一的目录入口，缓存 120 秒、失败也缓存、并发调用合并成一个在途请求，扫描开始时显式重置。富元数据发现（`discover_models_detailed`）和探测（`probe`）**共用这同一份行数据**——以前它们各抓各的，ZenMux 150KB 的目录在 6 并发挤代理时第二次超时，六行全被报成"没有数据"。要加新的目录消费者就接 `_provider_rows()`，别再自己发请求
 - **后台刷新**：启动时自动全量扫描，之后每 5 分钟（`SCAN_INTERVAL_MINUTES`）后台自动刷新
 - **状态颜色**：在线(绿) / 离线(红) / 异常(黄) / 未配置(灰) / 未知(蓝)
 - **provider 开关以设置页为准**：运行时状态存在 SQLite 的 `provider_settings` 表，由设置页（`PUT /api/providers/{key}`）唯一控制；`ProviderConfig.default_enabled` 只是**首次启动的默认值**，改它不会覆盖库里已有的用户选择。读取一律经 `core/provider_state.effective_enabled()`，不要再去 import config 的默认值
