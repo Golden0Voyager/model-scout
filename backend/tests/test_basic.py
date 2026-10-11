@@ -571,6 +571,116 @@ def test_free_providers_no_longer_lose_their_metadata(monkeypatch: pytest.Monkey
     assert row.is_free is True
 
 
+def test_the_cheapest_tier_is_the_headline_whatever_order_it_arrives_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier list is volume break points, so the monitor quotes the lowest rate."""
+    monkeypatch.setenv("ZENMUX_API_KEY", "test-key")
+    payload = {
+        "data": [
+            {
+                "id": "unsorted/tiered",
+                "pricings": {
+                    "prompt": [
+                        {"value": 4, "unit": "perMTokens", "currency": "USD"},
+                        {"value": 2, "unit": "perMTokens", "currency": "USD"},
+                    ],
+                    "completion": [
+                        {"value": 18, "unit": "perMTokens", "currency": "USD"},
+                        {"value": 8, "unit": "perMTokens", "currency": "USD"},
+                    ],
+                },
+            }
+        ]
+    }
+    checker, _ = _counting_checker(monkeypatch, payload=payload)
+
+    models, error = run(checker.discover_models_detailed("zenmux"))
+
+    assert error is None
+    assert models is not None
+    assert models[0]["pricing_input_per_1m"] == 2.0
+    assert models[0]["pricing_output_per_1m"] == 8.0
+
+
+def test_a_price_pair_that_cannot_be_billed_publishes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed units or two currencies are not a price, so they must not be shown as one."""
+    monkeypatch.setenv("ZENMUX_API_KEY", "test-key")
+    payload = {
+        "data": [
+            {
+                "id": "mixed/unit",
+                "pricings": {
+                    "prompt": [{"value": 0.000002, "unit": "perTokens", "currency": "USD"}],
+                    "completion": [{"value": 8, "unit": "perMTokens", "currency": "USD"}],
+                },
+            },
+            {
+                "id": "mixed/currency",
+                "pricings": {
+                    "prompt": [{"value": 1, "unit": "perMTokens", "currency": "USD"}],
+                    "completion": [{"value": 8, "unit": "perMTokens", "currency": "CNY"}],
+                },
+            },
+        ]
+    }
+    checker, _ = _counting_checker(monkeypatch, payload=payload)
+
+    models, error = run(checker.discover_models_detailed("zenmux"))
+
+    assert error is None
+    assert models is not None
+    for row in models:
+        assert "pricing_input_per_1m" not in row, row["id"]
+        assert "pricing_output_per_1m" not in row, row["id"]
+
+
+def test_modalities_nested_under_architecture_reach_the_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All 458 of OpenRouter's rows keep modalities under `architecture`, none at the top.
+
+    Reading only the flat field meant its image and audio output models were being
+    monitored, and paid for, as chat models.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    payload = {
+        "data": [
+            {
+                "id": "free/chat",
+                "name": "Free Chat",
+                "context_length": 200000,
+                "pricing": {"prompt": "0", "completion": "0"},
+                "architecture": {
+                    "input_modalities": ["text", "image"],
+                    "output_modalities": ["text"],
+                },
+            },
+            {
+                "id": "free/imagegen",
+                "name": "Free Image Generator",
+                "context_length": 8000,
+                "pricing": {"prompt": "0", "completion": "0"},
+                "architecture": {
+                    "input_modalities": ["text"],
+                    "output_modalities": ["image"],
+                },
+            },
+        ]
+    }
+    service = _service_with_payload(payload, monkeypatch)
+
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    rows = {m.id: m for m in service._discovered_models if m.provider == "openrouter"}
+    assert set(rows) == {"free/chat"}
+    assert "vision" in rows["free/chat"].capabilities
+    # The listing that retirement trusts still contains the rejected row.
+    assert service._listed["openrouter"] == {"free/chat", "free/imagegen"}
+
+
 # ---------------------------------------------------------------- provider switch
 
 DISABLED = {"agentrouter", "mimo", "anyrouter"}
