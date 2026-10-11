@@ -990,6 +990,17 @@ def test_a_model_that_answers_although_unlisted_stays(monkeypatch: pytest.Monkey
     assert service._retired == set()
 
 
+def test_a_restricted_model_is_never_retired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plan refusal proves nothing about the model's existence."""
+    service = _service_with_payload({"data": []}, monkeypatch)
+    _stub_probes(service, {GONE: "restricted"}, [])
+
+    _rescan(service)
+
+    assert service._retired == set()
+    assert run(database.get_retirements()) == {}
+
+
 def test_a_failed_catalogue_lookup_is_no_evidence_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
     """HTTP 500 from /models proves nothing about any model, so nothing may be dropped."""
     service = _service_with_payload({"data": []}, monkeypatch, status=500)
