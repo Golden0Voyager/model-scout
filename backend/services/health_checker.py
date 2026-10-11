@@ -496,10 +496,11 @@ class HealthChecker:
                     error_message="Model not found at provider",
                 )
             if "429" in msg:
-                if "quota" in msg.lower():
-                    # The model exists; this key's plan cannot call it. Unlike a
-                    # rate limit this never recovers on its own — the account
-                    # needs billing, not time.
+                if "exceeded your current quota" in msg.lower():
+                    # The billing-refusal signature phrase — distinct from
+                    # recoverable RPM/TPM limits, which also mention quota but
+                    # recover in seconds. This never recovers on its own: the
+                    # account needs billing, not time.
                     return ProbeResult(
                         model_id=model_id,
                         provider=provider.key,

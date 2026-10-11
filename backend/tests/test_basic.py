@@ -1942,6 +1942,17 @@ QUOTA_429 = (
     "'You exceeded your current quota, please check your plan and billing details.'}}]"
 )
 PLAIN_429 = "Error code: 429 - [{'error': {'code': 429, 'message': 'Rate limit reached'}}]"
+TRANSIENT_RPM_429 = (
+    "Error code: 429 - {'error': {'code': 429, 'message': "
+    "\"Quota exceeded for quota metric 'Generate Content API requests per minute' "
+    "and limit 'GenerateContentRequestsPerMinutePerProjectPerBaseModelWithMcpDeployment'"
+    "' on model 'gemini-2.5-pro' for project 'projects/123'. "
+    "Please retry in 30s.\"}}"
+)
+CAPITALISED_QUOTA_429 = (
+    "Error code: 429 - [{'error': {'code': 429, 'message': "
+    "'You exceeded your current Quota, please check your plan and billing details.'}}]"
+)
 
 
 class _RaisingCompletions:
@@ -1963,7 +1974,9 @@ class _FakeOpenAI:
     ("message", "expected_status", "expected_error"),
     [
         (QUOTA_429, "restricted", "Plan quota exceeded (needs billing)"),
+        (CAPITALISED_QUOTA_429, "restricted", "Plan quota exceeded (needs billing)"),
         (PLAIN_429, "error", "Rate limited (429)"),
+        (TRANSIENT_RPM_429, "error", "Rate limited (429)"),
     ],
 )
 def test_a_429_is_classified_by_its_semantics(

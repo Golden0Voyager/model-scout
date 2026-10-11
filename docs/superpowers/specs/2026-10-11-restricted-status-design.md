@@ -29,7 +29,7 @@ Gemini 免费档 API key 的面板上出现大量「Rate limited (429)」。诊�
 
 `_probe_chat_ping` 的 429 分支按错误内容细分：
 
-- 错误信息含 `quota`（不区分大小写）→ `status="restricted"`，`error_message="Plan quota exceeded (needs billing)"`。
+- 错误信息含 `exceeded your current quota`（不区分大小写；这是计费拒绝的标志性短语——裸 "quota" 会误匹配 Google 可恢复的 RPM/TPM 限流报文）→ `status="restricted"`，`error_message="Plan quota exceeded (needs billing)"`。
 - 其余 429 → 保持现状：`status="error"`，`error_message="Rate limited (429)"`。
 
 `restricted` 是探测结果的终态之一，与 `online` / `offline` / `error` / `no_key` / `unknown` 并列。
@@ -61,6 +61,7 @@ Gemini 免费档 API key 的面板上出现大量「Rate limited (429)」。诊�
 - **不按 `/models` 列表过滤模型**（见背景：列表语义在 provider 间不一致，会误伤）。
 - **不修复 `_model_ids` 的 `models/` 前缀**（见背景：失效反而是对的）。
 - **不在本轮隐藏 restricted 模型**（先分类呈现；如需隐藏，后续加前端过滤开关）。
+- **已知限制**：付费档 TPM 限流偶尔复用 plan/billing 文案，关键词方案无法 100% 区分，属可接受残留。
 
 ## 测试
 
