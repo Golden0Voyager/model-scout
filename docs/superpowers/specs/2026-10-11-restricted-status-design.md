@@ -65,6 +65,6 @@ Gemini 免费档 API key 的面板上出现大量「Rate limited (429)」。诊�
 
 ## 测试
 
-1. 单测：假 client 抛 429 + quota 文案 → `restricted`；429 + 其他文案 → `error` + "Rate limited (429)"。复用现有 monkeypatch 假 client 模式。
+1. 单测：假 client 抛 429 + `exceeded your current quota` 文案 → `restricted`；429 + 其他文案（含瞬态 RPM 限流报文）→ `error` + "Rate limited (429)"。复用现有 monkeypatch 假 client 模式。
 2. 回归：`restricted` 结果不写入 `model_retirements`。
 3. 质量门禁：`ruff` / `mypy` / `pytest` 全绿；前端 `npm run lint` + `tsc --noEmit`。
