@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -1920,3 +1921,54 @@ def test_read_path_still_makes_no_outbound_request_with_fx() -> None:
     api.routes.fx_rate = fx
     assert _client(_stub_service(urls)).get("/api/models").status_code == 200
     assert urls == []
+
+
+# ---------------------------------------------------------------- 429 semantics
+
+
+QUOTA_429 = (
+    "Error code: 429 - [{'error': {'code': 429, 'message': "
+    "'You exceeded your current quota, please check your plan and billing details.'}}]"
+)
+PLAIN_429 = "Error code: 429 - [{'error': {'code': 429, 'message': 'Rate limit reached'}}]"
+
+
+class _RaisingCompletions:
+    """A chat.completions stub that always raises, mimicking a failed ping."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    async def create(self, **kwargs: Any) -> Any:
+        raise Exception(self._message)
+
+
+class _FakeOpenAI:
+    def __init__(self, message: str) -> None:
+        self.chat = SimpleNamespace(completions=_RaisingCompletions(message))
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_status", "expected_error"),
+    [
+        (QUOTA_429, "restricted", "Plan quota exceeded (needs billing)"),
+        (PLAIN_429, "error", "Rate limited (429)"),
+    ],
+)
+def test_a_429_is_classified_by_its_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    expected_status: str,
+    expected_error: str,
+) -> None:
+    """A quota refusal is a plan problem, not a temporary rate limit."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    checker = HealthChecker()
+    checker._get_openai_client = lambda provider: _FakeOpenAI(message)  # type: ignore[method-assign, assignment, return-value]
+    provider = get_provider_config("gemini")
+    assert provider is not None
+
+    result = run(checker._probe_chat_ping("gemini-2.5-pro", provider))
+
+    assert result.status == expected_status
+    assert result.error_message == expected_error

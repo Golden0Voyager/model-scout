@@ -22,7 +22,7 @@ from core.config import ProviderConfig, get_provider_config
 class ProbeResult:
     model_id: str
     provider: str
-    status: str  # online | offline | unknown | error | no_key
+    status: str  # online | offline | unknown | error | no_key | restricted
     latency_ms: int | None = None
     error_message: str | None = None
 
@@ -496,6 +496,16 @@ class HealthChecker:
                     error_message="Model not found at provider",
                 )
             if "429" in msg:
+                if "quota" in msg.lower():
+                    # The model exists; this key's plan cannot call it. Unlike a
+                    # rate limit this never recovers on its own — the account
+                    # needs billing, not time.
+                    return ProbeResult(
+                        model_id=model_id,
+                        provider=provider.key,
+                        status="restricted",
+                        error_message="Plan quota exceeded (needs billing)",
+                    )
                 return ProbeResult(
                     model_id=model_id,
                     provider=provider.key,
