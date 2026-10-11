@@ -39,13 +39,26 @@ _CAPABILITY_BY_FLAG = {
 }
 
 
+def _modalities(raw: dict[str, Any], field: str) -> list[str]:
+    """Declared modalities, wherever this provider puts them.
+
+    OpenRouter publishes none of this at the top level — all 458 of its rows keep it
+    under `architecture` — so reading only the flat field made every one of its models
+    look text-only, and hid its image and audio generators from the non-chat filter.
+    """
+    value = raw.get(field)
+    if not value and isinstance(raw.get("architecture"), dict):
+        value = raw["architecture"].get(field)
+    return [str(v) for v in (value or [])]
+
+
 def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
     """Derive capability tags from whichever schema this provider publishes."""
     capabilities = ["chat"]
     if (
         raw.get("supports_image_in")
         or raw.get("supports_vision")
-        or "image" in (raw.get("input_modalities") or [])
+        or "image" in _modalities(raw, "input_modalities")
     ):
         capabilities.append("vision")
     for feature in raw.get("supported_features") or []:
@@ -64,11 +77,26 @@ def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
 
 
 def _base_tier(tiers: Any) -> dict[str, Any] | None:
-    """The entry price of a tiered price list, ignoring volume break points."""
+    """The cheapest entry in a tiered price list, however the provider ordered it.
+
+    Tiers are volume break points, so the headline a monitor should show is "from $X" —
+    the lowest rate. Picking index 0 trusted the list to arrive sorted, which ZenMux
+    does today but is not something its schema promises.
+    """
     if not isinstance(tiers, list) or not tiers:
         return None
-    first = tiers[0]
-    return first if isinstance(first, dict) else None
+
+    candidates = [tier for tier in tiers if isinstance(tier, dict)]
+    if not candidates:
+        return None
+
+    def _value(tier: dict[str, Any]) -> float:
+        try:
+            return float(tier["value"])
+        except (KeyError, TypeError, ValueError):
+            return float("inf")
+
+    return min(candidates, key=_value)
 
 
 def _pricing_info(raw: dict[str, Any]) -> dict[str, Any]:
@@ -103,7 +131,20 @@ def _pricing_info(raw: dict[str, Any]) -> dict[str, Any]:
     if isinstance(tiers, dict):
         prompt = _base_tier(tiers.get("prompt"))
         completion = _base_tier(tiers.get("completion"))
-        if not prompt or not completion or prompt.get("unit") != "perMTokens":
+        # Both sides must be stated in per-1M tokens, and in one currency: mixing a
+        # per-token input rate with a per-million output rate, or USD with CNY, would
+        # publish a price pair that no request can actually be billed at.
+        if (
+            not prompt
+            or not completion
+            or prompt.get("unit") != "perMTokens"
+            or completion.get("unit") != "perMTokens"
+            or (
+                prompt.get("currency")
+                and completion.get("currency")
+                and prompt.get("currency") != completion.get("currency")
+            )
+        ):
             return {}
         try:
             in_price = float(prompt["value"])
@@ -524,7 +565,7 @@ class HealthChecker:
             info["capabilities"] = _capabilities(m, context_length)
             # Aggregators list image, video, TTS and embedding models beside the chat
             # ones. The sync layer needs the declared outputs to tell them apart.
-            info["output_modalities"] = [str(v) for v in (m.get("output_modalities") or [])]
+            info["output_modalities"] = _modalities(m, "output_modalities")
             info.update(_pricing_info(m))
             results.append(info)
         return results, None
