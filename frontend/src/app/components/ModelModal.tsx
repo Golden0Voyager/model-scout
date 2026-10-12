@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   X,
+  Ban,
   Copy,
   Check,
   RefreshCw,
@@ -50,6 +51,7 @@ const STATUS_META: Record<string, { label: string; color: string; icon: React.Re
   error: { label: "Error", color: "#f59e0b", icon: <Activity className="w-4 h-4" /> },
   no_key: { label: "No Key", color: "#64748b", icon: <Key className="w-4 h-4" /> },
   unknown: { label: "Unknown", color: "#3b82f6", icon: <HelpCircle className="w-4 h-4" /> },
+  restricted: { label: "Restricted", color: "#d97706", icon: <Ban className="w-4 h-4" /> },
 };
 
 const CAPABILITY_LABELS: Record<string, string> = {

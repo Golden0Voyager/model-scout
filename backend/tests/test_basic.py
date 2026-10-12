@@ -13,6 +13,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -547,6 +548,62 @@ def test_free_only_and_non_chat_outputs_are_filtered_out(monkeypatch: pytest.Mon
     }
 
 
+def test_tokenharbor_metadata_is_parsed_from_its_own_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TokenHarbor names rows via `label`, prices USD-per-1M at input_usd_per_1m.
+
+    Sampled from the live /v1/models (68 rows through the overseas proxy; direct
+    connections answer `region_blocked`). Its `pricing` dict has no `prompt` key, so
+    the generic per-token branch would read both sides as absent and publish every
+    paid model as free.
+    """
+    monkeypatch.setenv("TOKENHARBOR_API_KEY", "test-key")
+    payload = {
+        "data": [
+            {
+                "id": "claude-sonnet-4.6",
+                "label": "Claude Sonnet 4.6",
+                "blurb": "Claude Sonnet 4.6.",
+                "tier": "high",
+                "pricing": {"input_usd_per_1m": 3, "output_usd_per_1m": 15},
+                "context_length": None,
+                "tool_call": True,
+                "function_call": True,
+            },
+            {
+                "id": "mimo-v2.5:free",
+                "label": "MiMo V2.5 (Free)",
+                "blurb": "Free-tier only — never billed.",
+                "tier": "high",
+                "pricing": {"input_usd_per_1m": 0, "output_usd_per_1m": 0},
+                "context_length": 131072,
+                "tool_call": True,
+                "function_call": True,
+            },
+        ]
+    }
+    checker, _ = _counting_checker(monkeypatch, payload=payload)
+
+    models, error = run(checker.discover_models_detailed("tokenharbor"))
+
+    assert error is None
+    assert models is not None
+    by_id = {m["id"]: m for m in models}
+
+    paid = by_id["claude-sonnet-4.6"]
+    assert paid["name"] == "Claude Sonnet 4.6"
+    assert paid["description"] == "Claude Sonnet 4.6."
+    assert paid["pricing_input_per_1m"] == 3.0
+    assert paid["pricing_output_per_1m"] == 15.0
+    assert paid["pricing_currency"] == "USD"
+    assert paid["is_free"] is False
+    assert "function_calling" in paid["capabilities"]
+
+    free = by_id["mimo-v2.5:free"]
+    assert free["is_free"] is True
+    assert free["name"] == "MiMo V2.5 (Free)"
+    assert free["context_length"] == 131072
+
+
 def test_free_providers_no_longer_lose_their_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
     """OpenRouter rows used to be built with context 0 by a name-specific branch."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
@@ -987,6 +1044,17 @@ def test_a_model_that_answers_although_unlisted_stays(monkeypatch: pytest.Monkey
     _rescan(service)
 
     assert service._retired == set()
+
+
+def test_a_restricted_model_is_never_retired(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A plan refusal proves nothing about the model's existence."""
+    service = _service_with_payload({"data": []}, monkeypatch)
+    _stub_probes(service, {GONE: "restricted"}, [])
+
+    _rescan(service)
+
+    assert service._retired == set()
+    assert run(database.get_retirements()) == {}
 
 
 def test_a_failed_catalogue_lookup_is_no_evidence_at_all(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1920,3 +1988,67 @@ def test_read_path_still_makes_no_outbound_request_with_fx() -> None:
     api.routes.fx_rate = fx
     assert _client(_stub_service(urls)).get("/api/models").status_code == 200
     assert urls == []
+
+
+# ---------------------------------------------------------------- 429 semantics
+
+
+QUOTA_429 = (
+    "Error code: 429 - [{'error': {'code': 429, 'message': "
+    "'You exceeded your current quota, please check your plan and billing details.'}}]"
+)
+PLAIN_429 = "Error code: 429 - [{'error': {'code': 429, 'message': 'Rate limit reached'}}]"
+TRANSIENT_RPM_429 = (
+    "Error code: 429 - {'error': {'code': 429, 'message': "
+    "\"Quota exceeded for quota metric 'Generate Content API requests per minute' "
+    "and limit 'GenerateContentRequestsPerMinutePerProjectPerBaseModelWithMcpDeployment'"
+    "' on model 'gemini-2.5-pro' for project 'projects/123'. "
+    "Please retry in 30s.\"}}"
+)
+CAPITALISED_QUOTA_429 = (
+    "Error code: 429 - [{'error': {'code': 429, 'message': "
+    "'You exceeded your current Quota, please check your plan and billing details.'}}]"
+)
+
+
+class _RaisingCompletions:
+    """A chat.completions stub that always raises, mimicking a failed ping."""
+
+    def __init__(self, message: str) -> None:
+        self._message = message
+
+    async def create(self, **kwargs: Any) -> Any:
+        raise Exception(self._message)
+
+
+class _FakeOpenAI:
+    def __init__(self, message: str) -> None:
+        self.chat = SimpleNamespace(completions=_RaisingCompletions(message))
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_status", "expected_error"),
+    [
+        (QUOTA_429, "restricted", "Plan quota exceeded (needs billing)"),
+        (CAPITALISED_QUOTA_429, "restricted", "Plan quota exceeded (needs billing)"),
+        (PLAIN_429, "error", "Rate limited (429)"),
+        (TRANSIENT_RPM_429, "error", "Rate limited (429)"),
+    ],
+)
+def test_a_429_is_classified_by_its_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+    expected_status: str,
+    expected_error: str,
+) -> None:
+    """A quota refusal is a plan problem, not a temporary rate limit."""
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    checker = HealthChecker()
+    checker._get_openai_client = lambda provider: _FakeOpenAI(message)  # type: ignore[method-assign, assignment, return-value]
+    provider = get_provider_config("gemini")
+    assert provider is not None
+
+    result = run(checker._probe_chat_ping("gemini-2.5-pro", provider))
+
+    assert result.status == expected_status
+    assert result.error_message == expected_error

@@ -22,7 +22,7 @@ from core.config import ProviderConfig, get_provider_config
 class ProbeResult:
     model_id: str
     provider: str
-    status: str  # online | offline | unknown | error | no_key
+    status: str  # online | offline | unknown | error | no_key | restricted
     latency_ms: int | None = None
     error_message: str | None = None
 
@@ -68,7 +68,12 @@ def _capabilities(raw: dict[str, Any], context_length: int) -> list[str]:
     for flag, capability in _CAPABILITY_BY_FLAG.items():
         if (raw.get("capabilities") or {}).get(flag) and capability not in capabilities:
             capabilities.append(capability)
-    for flag, capability in (("supports_tools", "function_calling"), ("supports_reasoning", "reasoning")):
+    # TokenHarbor calls the tool-support flag `tool_call`/`function_call`.
+    for flag, capability in (
+        ("supports_tools", "function_calling"),
+        ("supports_reasoning", "reasoning"),
+        ("tool_call", "function_calling"),
+    ):
         if raw.get(flag) and capability not in capabilities:
             capabilities.append(capability)
     if context_length >= 1_000_000:
@@ -102,9 +107,10 @@ def _base_tier(tiers: Any) -> dict[str, Any] | None:
 def _pricing_info(raw: dict[str, Any]) -> dict[str, Any]:
     """Normalise a published price into the per-1M amount the catalog stores.
 
-    Three shapes exist in the wild. OpenRouter and SenseNova give USD **per token** in
+    Four shapes exist in the wild. OpenRouter and SenseNova give USD **per token** in
     a `pricing` object; TokenRhythm gives CNY **per 1M tokens** and keeps base and
-    discounted rates apart; ZenMux gives USD **per 1M tokens** as a list of tiers.
+    discounted rates apart; ZenMux gives USD **per 1M tokens** as a list of tiers;
+    TokenHarbor gives USD **per 1M tokens** as input_usd_per_1m with no `prompt` key.
     Reading any of them with another's multiplier is a million-fold error, so each
     branch states its own unit instead of the code assuming one.
     """
@@ -161,6 +167,21 @@ def _pricing_info(raw: dict[str, Any]) -> dict[str, Any]:
     pricing = raw.get("pricing")
     if not isinstance(pricing, dict):
         return {}
+    # TokenHarbor publishes USD per 1M directly as input_usd_per_1m/output_usd_per_1m
+    # and omits `prompt` entirely — the generic branch below would read both sides as
+    # absent and publish every paid model as free.
+    if "input_usd_per_1m" in pricing or "output_usd_per_1m" in pricing:
+        try:
+            in_price = float(pricing.get("input_usd_per_1m", 0))
+            out_price = float(pricing.get("output_usd_per_1m", 0))
+        except (TypeError, ValueError):
+            return {}
+        return {
+            "pricing_input_per_1m": in_price,
+            "pricing_output_per_1m": out_price,
+            "pricing_currency": "USD",
+            "is_free": in_price == 0.0 and out_price == 0.0,
+        }
     scale = 1_000_000.0 if "1m" not in str(pricing.get("unit") or "") else 1.0
     try:
         prompt_price = float(pricing.get("prompt", 0))
@@ -496,6 +517,17 @@ class HealthChecker:
                     error_message="Model not found at provider",
                 )
             if "429" in msg:
+                if "exceeded your current quota" in msg.lower():
+                    # The billing-refusal signature phrase — distinct from
+                    # recoverable RPM/TPM limits, which also mention quota but
+                    # recover in seconds. This never recovers on its own: the
+                    # account needs billing, not time.
+                    return ProbeResult(
+                        model_id=model_id,
+                        provider=provider.key,
+                        status="restricted",
+                        error_message="Plan quota exceeded (needs billing)",
+                    )
                 return ProbeResult(
                     model_id=model_id,
                     provider=provider.key,
@@ -552,7 +584,8 @@ class HealthChecker:
                 continue
             info: dict[str, Any] = {
                 "id": mid,
-                "name": m.get("name") or m.get("display_name") or mid,
+                # ZenMux calls it display_name, TokenHarbor calls it label.
+                "name": m.get("name") or m.get("display_name") or m.get("label") or mid,
             }
             context_length = int(m.get("context_length") or 0)
             if context_length:
@@ -560,8 +593,9 @@ class HealthChecker:
             max_output = m.get("max_output_length") or m.get("max_completion_tokens")
             if max_output:
                 info["max_output_tokens"] = int(max_output)
-            if m.get("description"):
-                info["description"] = m["description"]
+            # TokenHarbor calls its one-line summary `blurb`, not `description`.
+            if m.get("description") or m.get("blurb"):
+                info["description"] = m["description"] if m.get("description") else m["blurb"]
             info["capabilities"] = _capabilities(m, context_length)
             # Aggregators list image, video, TTS and embedding models beside the chat
             # ones. The sync layer needs the declared outputs to tell them apart.

@@ -3,6 +3,7 @@
 import { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import {
   Activity,
+  Ban,
   Zap,
   RefreshCw,
   Search,
@@ -101,6 +102,7 @@ const STATUS_META: Record<string, { label: string; color: string; icon: React.Re
   error: { label: "Error", color: "#f59e0b", icon: <Activity className="w-3.5 h-3.5" />, sortOrder: 2 },
   no_key: { label: "No Key", color: "#64748b", icon: <Key className="w-3.5 h-3.5" />, sortOrder: 3 },
   unknown: { label: "Unknown", color: "#3b82f6", icon: <HelpCircle className="w-3.5 h-3.5" />, sortOrder: 4 },
+  restricted: { label: "Restricted", color: "#d97706", icon: <Ban className="w-3.5 h-3.5" />, sortOrder: 5 },
 };
 
 const CAPABILITY_LABELS: Record<string, string> = {
@@ -127,6 +129,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   agentrouter: "#06b6d4",
   tokenrhythm: "#f43f5e",
   zenmux: "#14b8a6",
+  tokenharbor: "#eab308",
 };
 
 const TAB_CONFIG: { key: TabFilter; label: string; icon: React.ReactNode }[] = [

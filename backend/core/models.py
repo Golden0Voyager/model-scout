@@ -25,7 +25,7 @@ class ModelInfo(BaseModel):
 class HealthStatus(BaseModel):
     model_id: str
     provider: str
-    status: str = "unknown"  # online | offline | unknown | error
+    status: str = "unknown"  # online | offline | unknown | error | no_key | restricted
     latency_ms: int | None = None
     error_message: str | None = None
     last_checked: str | None = None

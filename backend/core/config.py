@@ -278,6 +278,23 @@ PROVIDERS: dict[str, ProviderConfig] = {
         rich_discovery=True,
         free_only=True,
     ),
+    # TokenHarbor is an OpenAI-compatible reseller whose /v1/models carries USD-per-1M
+    # prices under input_usd_per_1m and free rows under a ":free" suffix. Measured: a
+    # direct connection answers `region_blocked` (US-sanctions/Mainland-China/HK/Macau
+    # policy), so every request must go through the overseas proxy. Only the :free
+    # tier is monitored; probing the paid rows would spend real money each scan.
+    "tokenharbor": ProviderConfig(
+        key="tokenharbor",
+        name="TokenHarbor",
+        base_url="https://tokenharbor.ai/v1",
+        api_key_env="TOKENHARBOR_API_KEY",
+        network="proxy",
+        discovery="dynamic",
+        models_endpoint="/models",
+        auto_discover=True,
+        rich_discovery=True,
+        free_only=True,
+    ),
 }
 
 
