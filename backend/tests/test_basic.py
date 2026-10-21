@@ -249,6 +249,32 @@ def test_tokenrhythm_matches_its_published_access_details() -> None:
     assert provider.rich_discovery is True
 
 
+def test_anyrouter_points_at_the_live_host_not_the_parked_domain() -> None:
+    """api.anyrouter.net has no DNS record; the service answers on anyrouter.top."""
+    provider = get_provider_config("anyrouter")
+    assert provider is not None
+    assert provider.base_url == "https://anyrouter.top/v1"
+    assert provider.discovery == "dynamic"
+    assert provider.models_endpoint == "/models"
+    assert provider.auto_discover is True
+
+
+def test_agentrouter_sends_the_client_fingerprint_its_gateway_requires() -> None:
+    """Its gateway answers 401 to unknown clients before it reads the token.
+
+    Measured: only `claude-cli/<version> (external, cli)` gets past the check, so
+    discovery and chat probes must both carry that UA or every call looks dead.
+    """
+    provider = get_provider_config("agentrouter")
+    assert provider is not None
+    assert provider.user_agent == "claude-cli/2.0.0 (external, cli)"
+
+    checker = HealthChecker()
+    headers = checker._get_auth_headers(provider, "test-key")
+    assert headers["User-Agent"] == provider.user_agent
+    assert headers["Authorization"] == "Bearer test-key"
+
+
 def test_tokenrhythm_catalogue_is_not_pinned_in_config() -> None:
     """What the account can call is an upstream fact, not a repo fact.
 
@@ -744,7 +770,7 @@ DISABLED = {"agentrouter", "mimo", "anyrouter"}
 # Static catalog rows per disabled provider; discovery is switched off for all three,
 # so these counts also pin that disabling never empties the catalog.
 DISABLED_MODEL_COUNTS = {"anyrouter": 11, "agentrouter": 3, "mimo": 4}
-DISABLED_HOSTS = ("agentrouter.org", "token-plan-cn.xiaomimimo.com", "anyrouter.net")
+DISABLED_HOSTS = ("agentrouter.org", "token-plan-cn.xiaomimimo.com", "anyrouter.top")
 
 
 def test_the_three_dead_providers_default_to_off() -> None:

@@ -95,8 +95,20 @@ model_scout/
 │       ├── page.tsx        # 主面板（卡片+列表双视图）
 │       └── globals.css     # 主题样式
 ├── start.sh                # 一键启动脚本
+├── scripts/
+│   └── audit_provider_keys.py  # 只读体检：key 来源 + /models 连通性（不打印密钥）
 └── verify_project.sh       # 项目验证脚本
 ```
+
+## 供应商体检
+
+```bash
+# key 是否加载、从哪个文件读到的、/models 是否连通（只打印状态，不打印密钥）
+backend/.venv/bin/python scripts/audit_provider_keys.py
+backend/.venv/bin/python scripts/audit_provider_keys.py --json --no-network
+```
+
+脚本会像 `start.sh` 一样先 `source ~/.zshrc`（其中会加载 `~/.zshenv.secrets`），再读 `backend/.env`，因此不会把只存在于 secrets 文件里的 key 误报为缺失。
 
 ## 支持的供应商
 
@@ -106,9 +118,10 @@ model_scout/
 | AIHubMix | models API + chat ping | 动态探测 |
 | DeepSeek | chat ping | 动态探测 |
 | Moonshot | chat ping | 动态探测 |
-| AnyRouter | 跳过（待配置 endpoint） | 仅展示信息 |
+| AnyRouter | models API + chat ping | 动态探测（默认关闭，域名 `anyrouter.top`） |
+| AgentRouter | models API + chat ping（固定 Claude CLI UA） | 动态探测（默认关闭） |
 
-> **注意**：AnyRouter 当前配置 `probe_mode=none`，仅作为占位符展示模型信息。如需启用探测，请在 `backend/core/config.py` 中补充 endpoint 和 API key 配置。
+> **注意**：AnyRouter 与 AgentRouter 默认关闭，需在设置页打开后才会探测与展示。AnyRouter 的旧域名 `api.anyrouter.net` 已无 DNS 记录，现指向 `anyrouter.top`；AgentRouter 的网关会按 User-Agent 识别客户端，非 `claude-cli/*` 一律回 401。
 
 ## API 端点
 

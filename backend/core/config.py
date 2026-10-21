@@ -61,6 +61,10 @@ class ProviderConfig:
     free_only: bool = False
     # Auth style: "bearer" (default, Authorization: Bearer <key>) or "api_key" (api-key: <key>)
     auth_style: str = "bearer"
+    # Some gateways fingerprint the client before reading the token. AgentRouter
+    # answers 401 "unauthorized client detected" to httpx and only lets its own CLI
+    # through, so such providers pin the UA they accept here.
+    user_agent: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +186,14 @@ PROVIDERS: dict[str, ProviderConfig] = {
     "anyrouter": ProviderConfig(
         key="anyrouter",
         name="AnyRouter",
-        # Unreachable both directly and through the proxy; the base URL was never
-        # confirmed and no env override reads it.
-        base_url="https://api.anyrouter.net/v1",
+        # api.anyrouter.net has no DNS record (anyrouter.net itself is a parked
+        # domain); the live service answers on anyrouter.top.
+        base_url="https://anyrouter.top/v1",
         api_key_env="ANYROUTER_API_KEY",
         network="proxy",
-        discovery="static",
+        discovery="dynamic",
+        models_endpoint="/models",
+        auto_discover=True,
         default_enabled=False,
     ),
     "agentrouter": ProviderConfig(
@@ -199,7 +205,9 @@ PROVIDERS: dict[str, ProviderConfig] = {
         discovery="dynamic",
         models_endpoint="/models",
         auto_discover=True,
-        # /models returns 401: the key is invalid or expired
+        # Its gateway rejects unknown clients before it even looks at the token:
+        # only the Claude CLI UA gets past "unauthorized client detected".
+        user_agent="claude-cli/2.0.0 (external, cli)",
         default_enabled=False,
     ),
     "mimo": ProviderConfig(

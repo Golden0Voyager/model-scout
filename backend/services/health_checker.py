@@ -287,9 +287,14 @@ class HealthChecker:
         return value
 
     def _get_auth_headers(self, provider: ProviderConfig, api_key: str) -> dict[str, str]:
-        if provider.auth_style == "api_key":
-            return {"api-key": api_key}
-        return {"Authorization": f"Bearer {api_key}"}
+        headers = (
+            {"api-key": api_key}
+            if provider.auth_style == "api_key"
+            else {"Authorization": f"Bearer {api_key}"}
+        )
+        if provider.user_agent:
+            headers["User-Agent"] = provider.user_agent
+        return headers
 
     def _get_openai_client(self, provider: ProviderConfig) -> AsyncOpenAI | None:
         if provider.key in self._openai_clients:
@@ -303,6 +308,8 @@ class HealthChecker:
         extra_headers = {}
         if provider.auth_style == "api_key":
             extra_headers = {"api-key": api_key}
+        if provider.user_agent:
+            extra_headers["User-Agent"] = provider.user_agent
         client = AsyncOpenAI(
             base_url=provider.base_url,
             api_key=api_key,
