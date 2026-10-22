@@ -65,6 +65,10 @@ class ProviderConfig:
     # answers 401 "unauthorized client detected" to httpx and only lets its own CLI
     # through, so such providers pin the UA they accept here.
     user_agent: str | None = None
+    # Non-chat audio models are normally filtered out of discovery. A provider that
+    # exposes ASR/TTS ids through its chat endpoint turns this on so they show up and
+    # get a real (low-frequency) probe instead of a chat ping.
+    include_audio_models: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -157,10 +161,15 @@ PROVIDERS: dict[str, ProviderConfig] = {
         name="DeepSeek",
         base_url="https://api.deepseek.com/v1",
         api_key_env="DEEPSEEK_API_KEY",
-        network="proxy",
+        # Domestic host; measured direct at ~0.7s. Routing it through the overseas
+        # proxy only made it share that proxy's outages.
+        network="direct",
         discovery="dynamic",
         models_endpoint="/models",
         auto_discover=True,
+        # /models carries name, context_window, max_output_tokens and input modalities,
+        # but no pricing — the pinned rows above supply that.
+        rich_discovery=True,
     ),
     "moonshot": ProviderConfig(
         key="moonshot",
@@ -233,6 +242,9 @@ PROVIDERS: dict[str, ProviderConfig] = {
         models_endpoint="/models",
         auth_style="api_key",
         auto_discover=True,
+        # Its catalogue includes mimo-v2.5-asr and the three mimo-v2.5-tts* ids;
+        # both kinds are called through /v1/chat/completions, not /v1/audio/*.
+        include_audio_models=True,
     ),
     "gemini": ProviderConfig(
         key="gemini",
@@ -384,59 +396,65 @@ STATIC_MODELS: list[ModelConfig] = [
     ),
 
     # ===== DeepSeek Official =====
+    # Official page (2026-10): only deepseek-flash (V4.1-Flash) and deepseek-v4-pro.
+    # Prices below are CNY per 1M tokens at the off-peak tier; peak doubles them.
+    # deepseek-chat / deepseek-reasoner still answer and route to deepseek-flash, so
+    # they stay pinned as aliases instead of disappearing from the panel.
     ModelConfig(
-        id="deepseek-chat",
-        name="DeepSeek-V3.2",
+        id="deepseek-flash",
+        name="DeepSeek-V4.1-Flash",
         provider="deepseek",
-        context_length=128000,
-        description="DeepSeek-V3.2 official. Price killer, matches GPT-4o class performance.",
-        description_cn="DeepSeek-V3.2 官方版，价格屠夫，性能对标 GPT-4o。",
-        capabilities=["chat", "coding", "reasoning"],
-        pricing_input_per_1m=2.0,
-        pricing_output_per_1m=3.0,
+        context_length=1048576,
+        max_output_tokens=393216,
+        description="DeepSeek-V4.1-Flash. 1M context, 384K max output, text + image input, non-thinking and thinking modes. Cache hit ¥0.02; peak ¥2 in / ¥8 out.",
+        description_cn="DeepSeek-V4.1-Flash，100万上下文，38.4万输出，支持图像理解与非思考/思考模式。缓存命中 ¥0.02；高峰时段输入 ¥2、输出 ¥8。",
+        capabilities=["chat", "coding", "reasoning", "function_calling", "vision"],
+        pricing_input_per_1m=1.0,
+        pricing_output_per_1m=4.0,
         pricing_currency="CNY",
-        pricing_note="Cache Hit ¥0.2",
-    ),
-    ModelConfig(
-        id="deepseek-reasoner",
-        name="DeepSeek-R1",
-        provider="deepseek",
-        context_length=128000,
-        description="DeepSeek-R1 official reasoning model. Exceptional math and code.",
-        description_cn="DeepSeek-R1 官方推理模型，数学和代码能力卓越。",
-        capabilities=["chat", "reasoning", "coding"],
-        pricing_input_per_1m=2.0,
-        pricing_output_per_1m=3.0,
-        pricing_currency="CNY",
-        pricing_note="Cache Hit ¥0.2",
-    ),
-    ModelConfig(
-        id="deepseek-v4-flash",
-        name="DeepSeek-V4 Flash",
-        provider="deepseek",
-        context_length=1000000,
-        max_output_tokens=384000,
-        description="DeepSeek-V4 Flash. 1M context, 384K max output. Lightweight variant with non-thinking and thinking (default) modes. Supports JSON Output, Tool Calls, Chat Prefix Completion and FIM Completion (Beta, non-thinking only).",
-        description_cn="DeepSeek-V4 Flash，100万上下文，38.4万最大输出。V4 系列轻量版，支持非思考和思考模式（默认）。支持 JSON 输出、工具调用、聊天前缀补全和 FIM 补全（Beta，仅非思考模式）。",
-        capabilities=["chat", "coding", "reasoning", "function_calling"],
-        pricing_input_per_1m=0.14,
-        pricing_output_per_1m=0.28,
-        pricing_currency="USD",
-        pricing_note="Cache Hit $0.028",
+        pricing_note="缓存命中 ¥0.02 · 高峰 ¥2 / ¥8",
     ),
     ModelConfig(
         id="deepseek-v4-pro",
-        name="DeepSeek-V4 Pro",
+        name="DeepSeek-V4-Pro",
         provider="deepseek",
-        context_length=1000000,
-        max_output_tokens=384000,
-        description="DeepSeek-V4 Pro. 1M context, 384K max output. Full-capability flagship with non-thinking and thinking (default) modes. Supports JSON Output, Tool Calls, Chat Prefix Completion and FIM Completion (Beta, non-thinking only).",
-        description_cn="DeepSeek-V4 Pro，100万上下文，38.4万最大输出。V4 代全能力旗舰模型，支持非思考和思考模式（默认）。支持 JSON 输出、工具调用、聊天前缀补全和 FIM 补全（Beta，仅非思考模式）。",
+        context_length=1048576,
+        max_output_tokens=393216,
+        description="DeepSeek-V4-Pro. 1M context, 384K max output, text-only flagship, non-thinking and thinking modes. Cache hit ¥0.15; peak ¥9 in / ¥27 out.",
+        description_cn="DeepSeek-V4-Pro，100万上下文，38.4万输出，纯文本旗舰，支持非思考/思考模式。缓存命中 ¥0.15；高峰时段输入 ¥9、输出 ¥27。",
         capabilities=["chat", "coding", "reasoning", "function_calling"],
-        pricing_input_per_1m=1.74,
-        pricing_output_per_1m=3.48,
-        pricing_currency="USD",
-        pricing_note="Cache Hit $0.145",
+        pricing_input_per_1m=4.5,
+        pricing_output_per_1m=13.5,
+        pricing_currency="CNY",
+        pricing_note="缓存命中 ¥0.15 · 高峰 ¥9 / ¥27",
+    ),
+    ModelConfig(
+        id="deepseek-chat",
+        name="DeepSeek-V4.1-Flash (chat alias)",
+        provider="deepseek",
+        context_length=1048576,
+        max_output_tokens=393216,
+        description="Legacy alias id. A live call answers as deepseek-flash, so it is billed and sized as V4.1-Flash, not V3.2.",
+        description_cn="旧别名 id。实测返回的模型是 deepseek-flash，按 V4.1-Flash 计费，已不是 V3.2。",
+        capabilities=["chat", "coding", "reasoning", "function_calling", "vision"],
+        pricing_input_per_1m=1.0,
+        pricing_output_per_1m=4.0,
+        pricing_currency="CNY",
+        pricing_note="缓存命中 ¥0.02 · 高峰 ¥2 / ¥8",
+    ),
+    ModelConfig(
+        id="deepseek-reasoner",
+        name="DeepSeek-V4.1-Flash (reasoner alias)",
+        provider="deepseek",
+        context_length=1048576,
+        max_output_tokens=393216,
+        description="Legacy reasoner alias id. A live call answers as deepseek-flash, so it is billed and sized as V4.1-Flash, not R1.",
+        description_cn="旧的推理别名 id。实测返回的模型是 deepseek-flash，按 V4.1-Flash 计费，已不是 R1。",
+        capabilities=["chat", "coding", "reasoning", "function_calling", "vision"],
+        pricing_input_per_1m=1.0,
+        pricing_output_per_1m=4.0,
+        pricing_currency="CNY",
+        pricing_note="缓存命中 ¥0.02 · 高峰 ¥2 / ¥8",
     ),
 
     # ===== ZhipuAI (智谱) Free Flash Models =====

@@ -62,6 +62,8 @@ const CAPABILITY_LABELS: Record<string, string> = {
   function_calling: "Tools",
   long_context: "Long Context",
   moE: "MoE",
+  asr: "ASR",
+  tts: "TTS",
 };
 
 function formatTimeFull(iso?: string): string {
@@ -207,18 +209,20 @@ export default function ModelModal({ model, onClose, onRefresh, isScanning, cnyP
               <div className="text-sm text-white font-medium">{model.provider_name}</div>
               <div className="text-[10px] text-slate-600 font-mono mt-0.5">{model.provider}</div>
             </div>
-            <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
-              <div className="flex items-center gap-2 mb-1.5">
-                <Database className="w-3.5 h-3.5 text-slate-500" />
-                <span className="text-[11px] text-slate-500 font-medium">Context</span>
-              </div>
-              <div className="text-sm text-white font-medium">{formatContext(model.context_length)}</div>
-              {model.max_output_tokens && (
-                <div className="text-[10px] text-slate-500 mt-0.5">
-                  Max out: {formatContext(model.max_output_tokens)}
+            {model.context_length > 0 && (
+              <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+                <div className="flex items-center gap-2 mb-1.5">
+                  <Database className="w-3.5 h-3.5 text-slate-500" />
+                  <span className="text-[11px] text-slate-500 font-medium">Context</span>
                 </div>
-              )}
-            </div>
+                <div className="text-sm text-white font-medium">{formatContext(model.context_length)}</div>
+                {model.max_output_tokens && (
+                  <div className="text-[10px] text-slate-500 mt-0.5">
+                    Max out: {formatContext(model.max_output_tokens)}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Pricing */}

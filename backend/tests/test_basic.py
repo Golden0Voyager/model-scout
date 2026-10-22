@@ -11,7 +11,7 @@ import re
 import socket
 import threading
 import time
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -112,6 +112,8 @@ def _stub_service(urls: list[str] | None = None) -> SyncService:
     checker = HealthChecker()
     checker._direct_client = httpx.AsyncClient(transport=transport)
     checker._proxy_client = httpx.AsyncClient(transport=transport)
+    checker._discovery_client_factory = lambda provider: httpx.AsyncClient(transport=transport)
+    checker._recycle_transports = False
     service._checker = checker
     service.recorded_requests = recorded  # type: ignore[attr-defined]
     return service
@@ -172,7 +174,7 @@ def _service_with_payload(
     Keys must exist for the providers under test, since discovery short-circuits on a
     missing key rather than sending an empty Authorization header.
     """
-    for env_name in ("MOONSHOT_API_KEY", "SENSENOVA_API_KEY", "AGENTROUTER_API_KEY", "MIMO_TOKEN_PLAN_KEY"):
+    for env_name in ("MOONSHOT_API_KEY", "SENSENOVA_API_KEY", "AGENTROUTER_API_KEY", "MIMO_TOKEN_PLAN_KEY", "MIMO_PAYG_API_KEY"):
         monkeypatch.setenv(env_name, "test-key")
     recorded: list[str] = []
 
@@ -185,6 +187,8 @@ def _service_with_payload(
     checker = HealthChecker()
     checker._direct_client = httpx.AsyncClient(transport=transport)
     checker._proxy_client = httpx.AsyncClient(transport=transport)
+    checker._discovery_client_factory = lambda provider: httpx.AsyncClient(transport=transport)
+    checker._recycle_transports = False
     service._checker = checker
     service.recorded_requests = recorded  # type: ignore[attr-defined]
     return service
@@ -837,6 +841,149 @@ def test_discovery_follows_the_switch_not_the_config(
     assert "mimo" in discovered_providers
 
 
+def test_discovery_retries_a_transient_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One dropped connection must not read as 'this provider has no models'."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("boom", request=request)
+        return httpx.Response(200, json={"data": [{"id": "a"}, {"id": "b"}]})
+
+    checker = HealthChecker()
+    checker._retry_delay = 0
+    checker._discovery_client_factory = lambda provider: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    ids, error = run(checker.discover_models("openrouter"))
+
+    assert error is None
+    assert set(ids or []) == {"a", "b"}
+    assert calls["n"] == 2
+
+
+def test_failed_discovery_keeps_the_previous_catalogue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proxy outage must dim the panel, not empty it."""
+    service = _service_with_payload(RICH_CATALOG, monkeypatch)
+    service._checker._retry_delay = 0
+    run(service._refresh_discovered_models(run(effective_enabled())))
+    before = {(m.provider, m.id) for m in service._discovered_models}
+    assert before
+
+    def failing(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    transport = httpx.MockTransport(failing)
+    service._checker._discovery_client_factory = lambda provider: httpx.AsyncClient(transport=transport)
+    service._checker.reset_model_cache()
+
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    after = {(m.provider, m.id) for m in service._discovered_models}
+    assert after == before
+    # Nothing was successfully listed, so retirement must not read this scan as evidence.
+    assert service._listed == {}
+
+
+def test_audio_models_are_discovered_only_for_opted_in_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "data": [
+            {"id": "mimo-v2.6-pro"},
+            {"id": "mimo-v2.5-asr"},
+            {"id": "mimo-v2.5-tts"},
+            {"id": "mimo-v2.5-tts-voiceclone"},
+        ]
+    }
+    service = _service_with_payload(payload, monkeypatch)
+
+    run(service._refresh_discovered_models(run(effective_enabled())))
+
+    by_id = {(m.provider, m.id): m for m in service._discovered_models}
+    asr = by_id[("mimo_payg", "mimo-v2.5-asr")]
+    assert asr.probe_mode == "asr"
+    assert asr.capabilities == ["asr"]
+    assert asr.context_length == 0
+    assert by_id[("mimo_payg", "mimo-v2.5-tts")].probe_mode == "tts"
+    assert by_id[("mimo_payg", "mimo-v2.5-tts-voiceclone")].probe_mode == "tts"
+    # Every other provider ships the same ids in this fixture; they must stay filtered.
+    assert not [
+        m for m in service._discovered_models
+        if m.provider != "mimo_payg" and m.id in {"mimo-v2.5-asr", "mimo-v2.5-tts"}
+    ]
+
+
+def test_audio_probes_are_gated_to_once_a_day() -> None:
+    model = ModelConfig(
+        id="mimo-v2.5-tts", name="mimo-v2.5-tts", provider="mimo_payg", context_length=0
+    )
+    key = ("mimo_payg", "mimo-v2.5-tts")
+    now = datetime.now(UTC)
+    assert SyncService._audio_probe_due(model, {}) is True
+    assert SyncService._audio_probe_due(model, {key: now.isoformat()}) is False
+    assert SyncService._audio_probe_due(model, {key: (now - timedelta(hours=25)).isoformat()}) is True
+
+
+def test_tts_probe_requires_audio_in_the_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMO_PAYG_API_KEY", "test-key")
+    checker, urls = _counting_checker(
+        monkeypatch, payload={"choices": [{"message": {"audio": {"data": "QUJD"}}}]}
+    )
+
+    result = run(checker.probe("mimo-v2.5-tts", "mimo_payg"))
+
+    assert result.status == "online"
+    assert urls and urls[0].endswith("/chat/completions")
+
+    empty, _ = _counting_checker(monkeypatch, payload={"choices": [{"message": {}}]})
+    result = run(empty.probe("mimo-v2.5-tts", "mimo_payg"))
+    assert result.status == "error"
+    assert "audio" in (result.error_message or "").lower()
+
+
+def test_asr_probe_surfaces_a_billing_refusal(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MIMO_PAYG_API_KEY", "test-key")
+    checker, _ = _counting_checker(
+        monkeypatch,
+        status=402,
+        payload={"error": {"message": "Insufficient account balance"}},
+    )
+
+    result = run(checker.probe("mimo-v2.5-asr", "mimo_payg"))
+
+    assert result.status == "error"
+    assert "402" in (result.error_message or "")
+
+
+def test_scan_rebuilds_every_transport_pool() -> None:
+    """A wedged pool in one scan must not be inherited by the next one."""
+    checker = HealthChecker()
+    probe_before = checker._proxy_client
+
+    run(checker.reset_transport())
+
+    assert checker._proxy_client is not probe_before
+    assert checker._proxy_client.is_closed is False
+
+
+def test_transport_recycling_can_be_disabled_for_injected_clients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _stub_service([])
+    assert service._checker is not None
+    injected = service._checker._proxy_client
+
+    run(service._checker.reset_transport())
+
+    assert service._checker._proxy_client is injected
+
+
 def test_scan_skips_every_model_of_a_disabled_provider() -> None:
     requested: list[dict[str, str]] = []
     service = _stub_service([])
@@ -1257,17 +1404,21 @@ def test_provider_settings_count_retired_models_separately(monkeypatch: pytest.M
     assert moonshot["model_count"] == _model_count("moonshot") - 1
 
 
-def test_speech_models_are_not_discovered_into_a_chat_panel(
+def test_speech_models_are_tagged_audio_not_chat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """MiMo ships -asr and -tts variants; neither is a chat model anyone compares here."""
+    """MiMo ships -asr and -tts variants; they belong in the panel with audio tags."""
     catalogue = {"data": [{"id": "mimo-v2.6-asr"}, {"id": "mimo-v2.6-tts"}, {"id": "mimo-v2.6-pro"}]}
     monkeypatch.setenv("MIMO_PAYG_API_KEY", "test-key")
     service = _service_with_payload(catalogue, monkeypatch)
     run(service._refresh_discovered_models(run(effective_enabled())))
 
-    found = {m.id for m in service._discovered_models if m.provider == "mimo_payg"}
-    assert found == {"mimo-v2.6-pro"}
+    found = {m.id: m for m in service._discovered_models if m.provider == "mimo_payg"}
+    assert set(found) == {"mimo-v2.6-asr", "mimo-v2.6-tts", "mimo-v2.6-pro"}
+    assert found["mimo-v2.6-asr"].capabilities == ["asr"]
+    assert found["mimo-v2.6-asr"].probe_mode == "asr"
+    assert found["mimo-v2.6-tts"].capabilities == ["tts"]
+    assert found["mimo-v2.6-pro"].capabilities == ["chat"]
 
 
 # ---------------------------------------------------------------- catalogue caching
@@ -1294,6 +1445,7 @@ def _counting_checker(
     transport = httpx.MockTransport(handler)
     checker._direct_client = httpx.AsyncClient(transport=transport)
     checker._proxy_client = httpx.AsyncClient(transport=transport)
+    checker._discovery_client_factory = lambda provider: httpx.AsyncClient(transport=transport)
     return checker, recorded
 
 
@@ -1344,9 +1496,11 @@ def test_a_transport_failure_always_names_itself(monkeypatch: pytest.MonkeyPatch
         raise TimeoutError("")
 
     checker = HealthChecker()
+    checker._retry_delay = 0
     transport = httpx.MockTransport(handler)
     checker._proxy_client = httpx.AsyncClient(transport=transport)
     checker._direct_client = httpx.AsyncClient(transport=transport)
+    checker._discovery_client_factory = lambda provider: httpx.AsyncClient(transport=transport)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
 
     rows, latency, error = run(checker._provider_rows(provider))
@@ -1371,13 +1525,15 @@ def test_concurrent_lookups_join_one_inflight_request(monkeypatch: pytest.Monkey
 def test_a_failed_lookup_is_cached(monkeypatch: pytest.MonkeyPatch) -> None:
     """Failures used to be re-fetched once per model, amplifying an outage 1:1 with size."""
     checker, urls = _counting_checker(monkeypatch, status=500)
+    checker._retry_delay = 0
     provider = PROVIDERS["openrouter"]
 
     async def scenario() -> list[Any]:
         return [await checker._fetch_provider_models(provider) for _ in range(10)]
 
     snapshots = run(scenario())
-    assert len(urls) == 1
+    # Three attempts for the first lookup (retry on 5xx), then the cached failure.
+    assert len(urls) == 3
     assert all(snap[2] == "HTTP 500" for snap in snapshots)
 
 

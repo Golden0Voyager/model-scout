@@ -113,6 +113,8 @@ const CAPABILITY_LABELS: Record<string, string> = {
   function_calling: "Tools",
   long_context: "Long Context",
   moE: "MoE",
+  asr: "ASR",
+  tts: "TTS",
 };
 
 const PROVIDER_COLORS: Record<string, string> = {
@@ -968,10 +970,12 @@ function ModelCard({ model, isScanning, onRefresh, onSelect, cnyPerUsd }: { mode
 
       {/* Metrics row */}
       <div className="flex items-center gap-4 mb-3 text-xs">
-        <div className="flex items-center gap-1 text-slate-400">
-          <Database className="w-3 h-3" />
-          <span>{formatContext(model.context_length)}</span>
-        </div>
+        {model.context_length > 0 && (
+          <div className="flex items-center gap-1 text-slate-400">
+            <Database className="w-3 h-3" />
+            <span>{formatContext(model.context_length)}</span>
+          </div>
+        )}
         {model.max_output_tokens && (
           <div className="flex items-center gap-1 text-slate-400">
             <Zap className="w-3 h-3" />

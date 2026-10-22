@@ -3,7 +3,7 @@
 import asyncio
 import time
 from collections.abc import Coroutine
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from core.config import PROVIDERS, ModelConfig, get_provider_config, get_static_models
@@ -24,6 +24,11 @@ from services.health_checker import HealthChecker, ProbeResult
 
 # Guards against cost amplification: each full scan spends real inference requests.
 MIN_SCAN_INTERVAL_SECONDS = 20.0
+
+# ASR/TTS probes generate or transcribe real audio, so they run once a day instead
+# of on every scan. Manual provider/model scans still probe them immediately.
+AUDIO_PROBE_MODES = {"asr", "tts"}
+AUDIO_PROBE_INTERVAL = timedelta(hours=24)
 
 
 class SyncService:
@@ -78,6 +83,11 @@ class SyncService:
         self._listed = {}
         discovered: list[ModelConfig] = []
         static_keys = {(m.provider, m.id) for m in get_static_models()}
+        # A failed lookup is not an empty catalogue: keep last scan's rows for any
+        # provider whose discovery fails this time.
+        previous: dict[str, list[ModelConfig]] = {}
+        for model in self._discovered_models:
+            previous.setdefault(model.provider, []).append(model)
 
         for provider_key, provider in PROVIDERS.items():
             if not enabled.get(provider_key, False):
@@ -92,6 +102,9 @@ class SyncService:
                 if models_info is None:
                     if error:
                         print(f"⚠️ Discovery failed for {provider.name}: {error}")
+                    discovered.extend(
+                        m for m in previous.get(provider_key, []) if (provider_key, m.id) not in static_keys
+                    )
                     continue
                 # Record everything the upstream lists, including rows this panel
                 # chooses not to monitor: retirement reads this as evidence of what
@@ -103,6 +116,28 @@ class SyncService:
                 for info in models_info:
                     mid = info["id"]
                     if (provider_key, mid) in static_keys:
+                        continue
+                    lower = mid.lower()
+                    audio_kind = None
+                    if lower.endswith("-asr") or "-asr-" in lower:
+                        audio_kind = "asr"
+                    elif "-tts" in lower:
+                        audio_kind = "tts"
+                    if audio_kind is not None:
+                        if not provider.include_audio_models:
+                            continue
+                        kind_cn = "语音识别" if audio_kind == "asr" else "语音合成"
+                        discovered.append(ModelConfig(
+                            id=mid,
+                            name=info.get("name", mid),
+                            provider=provider_key,
+                            context_length=0,
+                            description=f"Auto-discovered {audio_kind.upper()} model from {provider.name}",
+                            description_cn=f"从 {provider.name} 自动发现的{kind_cn}模型",
+                            capabilities=[audio_kind],
+                            probe_mode=audio_kind,
+                        ))
+                        kept += 1
                         continue
                     outputs = info.get("output_modalities") or []
                     if outputs and "text" not in outputs:
@@ -135,6 +170,9 @@ class SyncService:
             if model_ids is None:
                 if error:
                     print(f"⚠️ Discovery failed for {provider.name}: {error}")
+                discovered.extend(
+                    m for m in previous.get(provider_key, []) if (provider_key, m.id) not in static_keys
+                )
                 continue
             self._listed[provider_key] = {
                 # Gemini prefixes its ids with "models/" while every caller uses the bare
@@ -147,24 +185,49 @@ class SyncService:
                     mid = mid[len("models/"):]
                 if (provider_key, mid) in static_keys:
                     continue
+                lower = mid.lower()
+                audio_kind: str | None = None
+                if provider.include_audio_models:
+                    if lower.endswith("-asr") or "-asr-" in lower:
+                        audio_kind = "asr"
+                    elif "-tts" in lower:
+                        audio_kind = "tts"
                 # Skip non-chat models (embedding, image gen, video, audio, TTS, etc.)
                 _skip = ["embedding", "imagen", "veo", "lyria", "deep-research",
-                         "-tts", "-asr", "-audio", "-live", "-image-preview", "robotics",
+                         "-audio", "-live", "-image-preview", "robotics",
                          "computer-use", "aqa", "antigravity", "nano-banana",
                          "-customtools"]
-                if any(k in mid.lower() for k in _skip):
+                if audio_kind is None:
+                    _skip += ["-tts", "-asr"]
+                if any(k in lower for k in _skip):
                     continue
                 # Infer reasonable defaults from model ID
                 inferred_ctx = 128000
-                if any(k in mid.lower() for k in ["32k", "-32b"]):
+                if any(k in lower for k in ["32k", "-32b"]):
                     inferred_ctx = 32000
-                elif any(k in mid.lower() for k in ["256k", "-256b"]):
+                elif any(k in lower for k in ["256k", "-256b"]):
                     inferred_ctx = 256000
-                elif any(k in mid.lower() for k in ["1m", "1000000", "1000k"]):
+                elif any(k in lower for k in ["1m", "1000000", "1000k"]):
                     inferred_ctx = 1000000
                 # Gemini chat models default to 1M context (except Gemma)
                 if provider_key == "gemini" and mid.startswith("gemini-"):
                     inferred_ctx = 1000000
+
+                if audio_kind is not None:
+                    kind_label = "speech recognition" if audio_kind == "asr" else "speech synthesis"
+                    discovered.append(ModelConfig(
+                        id=mid,
+                        name=mid,
+                        provider=provider_key,
+                        # Context does not apply to audio; zero keeps the UI from
+                        # inventing a 128K window for a TTS voice.
+                        context_length=0,
+                        description=f"{kind_label.title()} model, auto-discovered from {provider.name}",
+                        description_cn=f"从 {provider.name} 自动发现的{'语音识别' if audio_kind == 'asr' else '语音合成'}模型",
+                        capabilities=[audio_kind],
+                        probe_mode=audio_kind,
+                    ))
+                    continue
 
                 discovered.append(ModelConfig(
                     id=mid,
@@ -181,6 +244,19 @@ class SyncService:
         self._discovered_at = datetime.now(UTC)
         if discovered:
             print(f"🔎 Discovered {len(discovered)} new models from dynamic providers")
+
+    @staticmethod
+    def _audio_probe_due(model: ModelConfig, last_checked: dict[tuple[str, str], Any]) -> bool:
+        raw = last_checked.get((model.provider, model.id))
+        if not raw:
+            return True
+        try:
+            checked = datetime.fromisoformat(str(raw))
+        except ValueError:
+            return True
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=UTC)
+        return datetime.now(UTC) - checked >= AUDIO_PROBE_INTERVAL
 
     def _visible(self, models: list[ModelConfig]) -> list[ModelConfig]:
         """Drop models the upstream has stopped serving.
@@ -269,6 +345,7 @@ class SyncService:
         # One snapshot per scan: every model of a provider should see the same
         # catalogue, fetched once.
         checker.reset_model_cache()
+        await checker.reset_transport()
         scan_id = await log_scan_start()
         start_time = datetime.now(UTC)
 
@@ -279,16 +356,27 @@ class SyncService:
             await self._refresh_discovered_models(enabled)
 
             models = self._visible(self._get_all_models())
+            last_checked = {
+                (row["provider"], row["model_id"]): row.get("last_checked")
+                for row in await get_all_health()
+            }
             probeable: list[ModelConfig] = []
             skipped: list[ModelConfig] = []
+            deferred: list[ModelConfig] = []
             for m in models:
                 if m.probe_mode == "none" or not enabled.get(m.provider, False):
                     skipped.append(m)
+                elif m.probe_mode in AUDIO_PROBE_MODES and not self._audio_probe_due(m, last_checked):
+                    # Keep the last verdict; do not overwrite it with "Probe disabled".
+                    deferred.append(m)
                 else:
                     probeable.append(m)
             probes = [{"model_id": m.id, "provider": m.provider} for m in probeable]
 
-            print(f"🔍 Starting health check for {len(probes)} models ({len(skipped)} skipped)...")
+            print(
+                f"🔍 Starting health check for {len(probes)} models "
+                f"({len(skipped)} skipped, {len(deferred)} audio deferred)..."
+            )
             results: list[ProbeResult] = await checker.probe_batch(probes, concurrency=6)
             retired_now = await self._apply_retirements(checker, results)
             online_count = 0

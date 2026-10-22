@@ -7,8 +7,11 @@ Replaces the heavy chat-completion benchmark with fast probes:
 """
 
 import asyncio
+import base64
+import io
 import os
 import time
+import wave
 from dataclasses import dataclass
 from typing import Any
 
@@ -244,18 +247,37 @@ def is_model_missing(message: str) -> bool:
     return any(marker in lowered for marker in _MODEL_MISSING_MARKERS)
 
 
+def _audio_kind(model_id: str) -> str | None:
+    """ASR/TTS ids are called through chat/completions on MiMo, not /audio/*."""
+    lower = model_id.lower()
+    if lower.endswith("-asr") or "-asr-" in lower:
+        return "asr"
+    if "-tts" in lower:
+        return "tts"
+    return None
+
+
+def _silence_wav_data_url() -> str:
+    """0.25s of 16kHz silence, base64 data URL — the cheapest valid ASR input."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(16000)
+        handle.writeframes(b"\x00\x00" * 4000)
+    return "data:audio/wav;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
+# Voice cloning needs a reference sample. Synthesising one once per process keeps the
+# daily probe at two calls instead of shipping a binary sample in the repo.
+_REFERENCE_VOICE: str | None = None
+
+
 class HealthChecker:
     def __init__(self, proxy: str | None = None):
         self._proxy = proxy
-        # trust_env=False keeps routing decisions with the provider's `network` field:
-        # with it left on, an ambient HTTPS_PROXY would silently pull the "direct"
-        # (domestic) providers through the overseas proxy as well.
-        self._proxy_client: httpx.AsyncClient = httpx.AsyncClient(
-            proxy=proxy, timeout=15.0, follow_redirects=True, trust_env=False
-        )
-        self._direct_client: httpx.AsyncClient = httpx.AsyncClient(
-            timeout=15.0, follow_redirects=True, trust_env=False
-        )
+        self._retry_delay = 1.0
+        self._recycle_transports = True
         self._openai_clients: dict[str, AsyncOpenAI] = {}
         # provider_key -> (fetched_at_ms, snapshot of the raw catalogue rows)
         self._models_cache: dict[str, tuple[int, RowsSnapshot]] = {}
@@ -265,6 +287,57 @@ class HealthChecker:
         # expired mid-scan and made every later model re-fetch. Scans also reset the
         # cache explicitly, so this bound only governs ad-hoc single-model probes.
         self._cache_ttl_ms = 120_000
+        self._discovery_client_factory = self._make_discovery_client
+        self._build_clients()
+
+    def _build_clients(self) -> None:
+        # trust_env=False keeps routing decisions with the provider's `network` field:
+        # with it left on, an ambient HTTPS_PROXY would silently pull the "direct"
+        # (domestic) providers through the overseas proxy as well.
+        #
+        # No keep-alive on purpose. Through the local proxy a reused connection can be
+        # dead on arrival (the peer sends FIN, the next request hangs until read
+        # timeout), and every such failure leaked a socket instead of freeing the pool
+        # slot. Each request gets its own connection now; TLS setup is the cheaper cost.
+        probe_limits = httpx.Limits(max_connections=32, max_keepalive_connections=0)
+        self._proxy_client: httpx.AsyncClient = httpx.AsyncClient(
+            proxy=self._proxy, timeout=15.0, follow_redirects=True, trust_env=False, limits=probe_limits
+        )
+        self._direct_client: httpx.AsyncClient = httpx.AsyncClient(
+            timeout=15.0, follow_redirects=True, trust_env=False, limits=probe_limits
+        )
+
+    def _make_discovery_client(self, provider: ProviderConfig) -> httpx.AsyncClient:
+        """One-shot client for a single catalogue attempt.
+
+        Catalogues used to share a pool with each other only, but one hung connection
+        still pinned a slot for the rest of the scan and surfaced as PoolTimeout. A
+        fresh client per attempt costs one TLS handshake and cannot be starved.
+        """
+        return httpx.AsyncClient(
+            proxy=self._proxy if provider.network != "direct" else None,
+            timeout=httpx.Timeout(15.0, connect=8.0, pool=5.0),
+            follow_redirects=True,
+            trust_env=False,
+            limits=httpx.Limits(max_connections=1, max_keepalive_connections=0),
+        )
+
+    async def reset_transport(self) -> None:
+        """Drop and rebuild the probe pool at the start of a scan.
+
+        The local proxy resets TLS under load, and httpcore can leave those sockets in
+        CLOSED state still counted against the pool. A long-running process therefore
+        wedges after a few bad scans while a fresh process works. Rebuilding once per
+        scan bounds that to the scan that caused it.
+        """
+        if not self._recycle_transports:
+            return
+        for client in self._openai_clients.values():
+            await client.close()
+        self._openai_clients.clear()
+        await self._proxy_client.aclose()
+        await self._direct_client.aclose()
+        self._build_clients()
 
     async def __aenter__(self) -> "HealthChecker":
         return self
@@ -315,6 +388,7 @@ class HealthChecker:
             api_key=api_key,
             http_client=http_client,
             default_headers=extra_headers or None,
+            max_retries=0,
         )
         self._openai_clients[provider.key] = client
         return client
@@ -371,22 +445,43 @@ class HealthChecker:
         if api_key is None:
             snapshot: RowsSnapshot = (None, None, f"no API key ({provider.api_key_env})")
         else:
-            client = self._get_http_client(provider)
             url = f"{provider.base_url}{provider.models_endpoint}"
-            headers = self._get_auth_headers(provider, api_key)
-            start = time.perf_counter()
-            try:
-                response = await client.get(url, headers=headers)
-                latency_ms = int((time.perf_counter() - start) * 1000)
-                if response.status_code == 200:
-                    snapshot = (response.json().get("data", []), latency_ms, None)
-                else:
-                    snapshot = (None, latency_ms, f"HTTP {response.status_code}")
-            except Exception as e:
-                snapshot = (None, None, _describe_error(e))
+            snapshot = await self._fetch_rows_with_retry(
+                provider,
+                url,
+                self._get_auth_headers(provider, api_key),
+            )
 
         self._models_cache[provider.key] = (int(time.time() * 1000), snapshot)
         return snapshot
+
+    async def _fetch_rows_with_retry(
+        self, provider: ProviderConfig, url: str, headers: dict[str, str]
+    ) -> RowsSnapshot:
+        """Three attempts: a flaky proxy must not read as 'this provider has no models'.
+
+        Client errors are final — 401/404 mean something about the key or the route,
+        not about the network. Transport errors and 5xx get retried.
+        """
+        attempts = 3
+        for attempt in range(attempts):
+            start = time.perf_counter()
+            try:
+                async with self._discovery_client_factory(provider) as client:
+                    response = await client.get(url, headers=headers)
+            except Exception as e:
+                if attempt < attempts - 1:
+                    await asyncio.sleep(self._retry_delay * (attempt + 1))
+                    continue
+                return (None, None, _describe_error(e))
+            latency_ms = int((time.perf_counter() - start) * 1000)
+            if response.status_code == 200:
+                return (response.json().get("data", []), latency_ms, None)
+            if response.status_code >= 500 and attempt < attempts - 1:
+                await asyncio.sleep(self._retry_delay * (attempt + 1))
+                continue
+            return (None, latency_ms, f"HTTP {response.status_code}")
+        return (None, None, "discovery failed")
 
     async def _fetch_provider_models(self, provider: ProviderConfig) -> ModelsSnapshot:
         """The provider's model ids, read from the same document the discovery step used."""
@@ -414,6 +509,12 @@ class HealthChecker:
                 status="no_key",
                 error_message=f"Missing API key ({provider.api_key_env})",
             )
+
+        # Audio models are listed like chat models, but "listed" is not "answers":
+        # the daily probe must actually synthesise/transcribe something.
+        kind = _audio_kind(model_id)
+        if kind and provider.include_audio_models:
+            return await self._probe_audio_ping(model_id, provider, kind, api_key)
 
         # Try models endpoint first (free, fast) - uses cache
         if provider.discovery == "dynamic" and provider.models_endpoint:
@@ -555,6 +656,160 @@ class HealthChecker:
                 error_message=msg[:120],
             )
 
+    async def _reference_voice(self, provider: ProviderConfig, api_key: str) -> str | None:
+        """One short synthesised sample, reused by every voice-clone probe."""
+        global _REFERENCE_VOICE
+        if _REFERENCE_VOICE:
+            return _REFERENCE_VOICE
+        headers = self._get_auth_headers(provider, api_key)
+        headers["Content-Type"] = "application/json"
+        payload = {
+            "model": "mimo-v2.5-tts",
+            "messages": [
+                {"role": "user", "content": "Say hello briefly."},
+                {"role": "assistant", "content": "Hi there."},
+            ],
+            "audio": {"format": "wav", "voice": "mimo_default"},
+        }
+        try:
+            response = await self._get_http_client(provider).post(
+                f"{provider.base_url}/chat/completions", headers=headers, json=payload, timeout=45.0
+            )
+            data = response.json()["choices"][0]["message"]["audio"]["data"]
+        except Exception:
+            return None
+        if not data:
+            return None
+        _REFERENCE_VOICE = "data:audio/wav;base64," + data
+        return _REFERENCE_VOICE
+
+    async def _probe_audio_ping(
+        self, model_id: str, provider: ProviderConfig, kind: str, api_key: str
+    ) -> ProbeResult:
+        """One real ASR/TTS call through the chat endpoint.
+
+        MiMo exposes both as chat completions: the assistant message is the text to
+        speak, an input_audio part is the audio to transcribe. Being listed in
+        /models is not evidence that either call works.
+        """
+        headers = self._get_auth_headers(provider, api_key)
+        headers["Content-Type"] = "application/json"
+        if kind == "tts":
+            lower = model_id.lower()
+            if lower.endswith("voiceclone"):
+                reference = await self._reference_voice(provider, api_key)
+                if not reference:
+                    return ProbeResult(
+                        model_id=model_id,
+                        provider=provider.key,
+                        status="error",
+                        error_message="Could not synthesise a reference voice",
+                    )
+                payload: dict[str, Any] = {
+                    "model": model_id,
+                    "messages": [
+                        {"role": "user", "content": ""},
+                        {"role": "assistant", "content": "Hi."},
+                    ],
+                    "audio": {"format": "wav", "voice": reference},
+                }
+            elif lower.endswith("voicedesign"):
+                payload = {
+                    "model": model_id,
+                    "messages": [
+                        {"role": "user", "content": "A calm, warm adult voice speaking slowly."},
+                        {"role": "assistant", "content": "Hi."},
+                    ],
+                    "audio": {"format": "wav"},
+                }
+            else:
+                payload = {
+                    "model": model_id,
+                    "messages": [
+                        {"role": "user", "content": "Say hello briefly."},
+                        {"role": "assistant", "content": "Hi."},
+                    ],
+                    "audio": {"format": "wav", "voice": "mimo_default"},
+                }
+        else:
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_audio", "input_audio": {"data": _silence_wav_data_url()}}
+                        ],
+                    }
+                ],
+                "asr_options": {"language": "auto"},
+            }
+
+        start = time.perf_counter()
+        try:
+            response = await self._get_http_client(provider).post(
+                f"{provider.base_url}/chat/completions", headers=headers, json=payload, timeout=45.0
+            )
+        except Exception as e:
+            return ProbeResult(
+                model_id=model_id,
+                provider=provider.key,
+                status="error",
+                error_message=_describe_error(e),
+            )
+        latency_ms = int((time.perf_counter() - start) * 1000)
+
+        if response.status_code != 200:
+            message = response.text[:200]
+            if is_model_missing(message):
+                return ProbeResult(
+                    model_id=model_id,
+                    provider=provider.key,
+                    status="offline",
+                    error_message="Model not found at provider",
+                )
+            return ProbeResult(
+                model_id=model_id,
+                provider=provider.key,
+                status="error",
+                latency_ms=latency_ms,
+                error_message=f"Error code: {response.status_code} - {message}",
+            )
+
+        try:
+            body = response.json()
+        except ValueError:
+            return ProbeResult(
+                model_id=model_id,
+                provider=provider.key,
+                status="error",
+                latency_ms=latency_ms,
+                error_message="Non-JSON response",
+            )
+        message = ((body.get("choices") or [{}])[0].get("message") or {})
+        if kind == "tts" and not (message.get("audio") or {}).get("data"):
+            return ProbeResult(
+                model_id=model_id,
+                provider=provider.key,
+                status="error",
+                latency_ms=latency_ms,
+                error_message="Empty audio response",
+            )
+        if kind == "asr" and message.get("content") is None:
+            return ProbeResult(
+                model_id=model_id,
+                provider=provider.key,
+                status="error",
+                latency_ms=latency_ms,
+                error_message="Empty transcription",
+            )
+        return ProbeResult(
+            model_id=model_id,
+            provider=provider.key,
+            status="online",
+            latency_ms=latency_ms,
+        )
+
     async def discover_models(self, provider_key: str) -> tuple[list[str] | None, str | None]:
         """Discover available model IDs from a dynamic provider."""
         provider = get_provider_config(provider_key)
@@ -594,10 +849,15 @@ class HealthChecker:
                 # ZenMux calls it display_name, TokenHarbor calls it label.
                 "name": m.get("name") or m.get("display_name") or m.get("label") or mid,
             }
-            context_length = int(m.get("context_length") or 0)
+            # DeepSeek publishes `context_window`, not `context_length`.
+            context_length = int(m.get("context_length") or m.get("context_window") or 0)
             if context_length:
                 info["context_length"] = context_length
-            max_output = m.get("max_output_length") or m.get("max_completion_tokens")
+            max_output = (
+                m.get("max_output_length")
+                or m.get("max_completion_tokens")
+                or m.get("max_output_tokens")
+            )
             if max_output:
                 info["max_output_tokens"] = int(max_output)
             # TokenHarbor calls its one-line summary `blurb`, not `description`.
@@ -616,23 +876,41 @@ class HealthChecker:
     ) -> list[ProbeResult]:
         """Probe multiple models with controlled concurrency."""
         semaphore = asyncio.Semaphore(concurrency)
+        # Audio calls are heavier and rate-sensitive; four of them next to each other
+        # can starve each other. They run once a day, so serialise them.
+        audio_semaphore = asyncio.Semaphore(1)
 
         async def _wrapped(p: dict[str, str]) -> ProbeResult:
-            async with semaphore:
+            kind = _audio_kind(p["model_id"])
+            gate = audio_semaphore if kind else semaphore
+            async with gate:
+                # Audio probes synthesise or transcribe real audio; voice cloning adds a
+                # reference generation. Once a day, a longer ceiling costs nothing.
+                timeout = 90.0 if kind else 20.0
                 try:
                     result = await asyncio.wait_for(
                         self.probe(p["model_id"], p["provider"]),
-                        timeout=20.0,
+                        timeout=timeout,
                     )
                 except TimeoutError:
                     return ProbeResult(
                         model_id=p["model_id"],
                         provider=p["provider"],
                         status="error",
-                        error_message="Probe timeout (20s)",
+                        error_message=f"Probe timeout ({int(timeout)}s)",
                     )
                 await asyncio.sleep(0.15)  # be polite to APIs
                 return result
 
         tasks = [_wrapped(p) for p in probes]
-        return await asyncio.gather(*tasks)
+        # Rebuild the pool every ~120 probes. A scan is long enough (hundreds of
+        # requests through a flaky proxy) that leaked sockets would otherwise exhaust
+        # it midway and turn the tail of the scan into timeouts.
+        chunk_size = 120
+        results: list[ProbeResult] = []
+        for start in range(0, len(probes), chunk_size):
+            chunk = tasks[start : start + chunk_size]
+            results.extend(await asyncio.gather(*chunk))
+            if start + chunk_size < len(probes):
+                await self.reset_transport()
+        return results
