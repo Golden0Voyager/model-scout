@@ -870,6 +870,7 @@ def test_failed_discovery_keeps_the_previous_catalogue(
 ) -> None:
     """A proxy outage must dim the panel, not empty it."""
     service = _service_with_payload(RICH_CATALOG, monkeypatch)
+    assert service._checker is not None
     service._checker._retry_delay = 0
     run(service._refresh_discovered_models(run(effective_enabled())))
     before = {(m.provider, m.id) for m in service._discovered_models}

@@ -229,6 +229,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- initial fetch; the interval below keeps polling
     fetchData();
     const interval = setInterval(fetchData, 30000);
     const onVis = () => {

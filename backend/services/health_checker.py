@@ -760,8 +760,8 @@ class HealthChecker:
         latency_ms = int((time.perf_counter() - start) * 1000)
 
         if response.status_code != 200:
-            message = response.text[:200]
-            if is_model_missing(message):
+            error_text = response.text[:200]
+            if is_model_missing(error_text):
                 return ProbeResult(
                     model_id=model_id,
                     provider=provider.key,
@@ -773,7 +773,7 @@ class HealthChecker:
                 provider=provider.key,
                 status="error",
                 latency_ms=latency_ms,
-                error_message=f"Error code: {response.status_code} - {message}",
+                error_message=f"Error code: {response.status_code} - {error_text}",
             )
 
         try:

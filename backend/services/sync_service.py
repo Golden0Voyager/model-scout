@@ -118,24 +118,24 @@ class SyncService:
                     if (provider_key, mid) in static_keys:
                         continue
                     lower = mid.lower()
-                    audio_kind = None
+                    rich_audio_kind = None
                     if lower.endswith("-asr") or "-asr-" in lower:
-                        audio_kind = "asr"
+                        rich_audio_kind = "asr"
                     elif "-tts" in lower:
-                        audio_kind = "tts"
-                    if audio_kind is not None:
+                        rich_audio_kind = "tts"
+                    if rich_audio_kind is not None:
                         if not provider.include_audio_models:
                             continue
-                        kind_cn = "语音识别" if audio_kind == "asr" else "语音合成"
+                        kind_cn = "语音识别" if rich_audio_kind == "asr" else "语音合成"
                         discovered.append(ModelConfig(
                             id=mid,
                             name=info.get("name", mid),
                             provider=provider_key,
                             context_length=0,
-                            description=f"Auto-discovered {audio_kind.upper()} model from {provider.name}",
+                            description=f"Auto-discovered {rich_audio_kind.upper()} model from {provider.name}",
                             description_cn=f"从 {provider.name} 自动发现的{kind_cn}模型",
-                            capabilities=[audio_kind],
-                            probe_mode=audio_kind,
+                            capabilities=[rich_audio_kind],
+                            probe_mode=rich_audio_kind,
                         ))
                         kept += 1
                         continue

@@ -70,6 +70,7 @@ export default function SettingsModal({ open, onClose, onChanged }: SettingsModa
   }, []);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- opening the panel is the fetch trigger
     if (open) void load();
   }, [open, load]);
 
